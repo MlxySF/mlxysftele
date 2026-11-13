@@ -49,6 +49,14 @@ native binding):
   streams per account, unread badges, search filter, per-account status dots,
   `PRO` badge for genuine server premium. Runs on its own background tokio
   runtime; the UI never blocks on the network.
+- **Images in chat** — send photos (attach button or just drop an image onto
+  the window) and see incoming photos inline in the message view. Images land
+  in `<data_dir>/cache/media/` and are rendered from that cache; anything
+  larger than 24 MB or undecodable (webp/gif/…) shows as a plain caption
+  instead of pretending to work.
+- **Readable chat view** — day-separator chips (Today/Yesterday/date),
+  distinct outgoing/incoming bubble tints with sensible contrast, larger
+  message text, and quick timestamps.
 - **Send / tail / dialogs / whoami / streamed downloads** from the CLI.
 - **`daemon`** — a headless multi-account hub: bounded hot set (`--max-hot`),
   idle eviction (`--idle-ttl`), one-line message stream per account, stdin
@@ -129,7 +137,10 @@ Every number below is a design property of the code, enforced by construction:
 - **Daemon "hot set" is bounded.** At most `--max-hot` connections stay open
   (default 4); eviction is least-recently-used, plus a `--idle-ttl` reaper.
 - **No caches.** No message cache, no media cache, no peer cache beyond what
-  Telegram returns in-flight. Downloads are chunked straight to disk.
+  Telegram returns in-flight. Downloads are chunked straight to disk. (The
+  GUI keeps a bounded recent-history buffer per open dialog and caches chat
+  photos under `cache/media/` so they can render — see
+  `src/gui.rs: MAX_CACHED_MESSAGES`.)
 - **Small allocator & binary.** current_thread runtime, `opt-level = "z"`,
   `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`.
   Optional `mimalloc` (`cargo build --release --features mimalloc`).

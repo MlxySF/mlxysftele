@@ -58,6 +58,8 @@ enum Cmd {
     RefreshDialogs { account: String },
     OpenChat { account: String, peer_id: PeerId },
     SendText { account: String, peer_id: PeerId, text: String },
+    /// Send a local image file as a photo; `caption` may be empty.
+    SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String },
     BeginLogin { name: String, phone: String },
     SubmitCode { name: String, code: String },
     SubmitPassword { name: String, password: String },
@@ -76,13 +78,32 @@ struct DialogItem {
     preview: Option<String>,
 }
 
+/// Media carried by a chat message.
+#[derive(Clone)]
+enum MsgMedia {
+    /// An image Telegram gave us (photo / image document / webp sticker);
+    /// downloaded to the local cache for inline rendering.
+    Photo,
+    /// Anything else — rendered as a muted caption label.
+    Label(String),
+}
+
 #[derive(Clone)]
 struct MsgItem {
     id: i32,
     outgoing: bool,
     unix: i64,
     text: String,
+    media: Option<MsgMedia>,
 }
+
+/// Cache key used for an image attached to `msg_id` in `account`'s chat `peer_id`.
+fn media_cache_key(account: &str, peer_id: PeerId, msg_id: i32) -> String {
+    format!("{account}_{}_{msg_id}", peer_id)
+}
+
+/// Don't auto-download anything larger than this.
+const MAX_MEDIA_BYTES: u64 = 24 * 1024 * 1024;
 
 #[derive(Clone)]
 struct MeInfo {
@@ -115,7 +136,16 @@ enum Evt {
     Dialogs { name: String, items: Vec<DialogItem> },
     History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
     Incoming { account: String, peer_id: PeerId, msg: MsgItem },
-    Sent { account: String, peer_id: PeerId, result: Result<MsgItem, String> },
+    Sent {
+        account: String,
+        peer_id: PeerId,
+        result: Result<MsgItem, String>,
+        /// Local source path when the sent message carries a photo we sent —
+        /// the GUI can cache it for display without re-downloading.
+        source_path: Option<PathBuf>,
+    },
+    /// An image finished downloading (or failed — empty `path`).
+    MediaReady { account: String, peer_id: PeerId, msg_id: i32, cache_key: String, path: PathBuf },
     Login { name: String, state: LoginEvt },
     Toast(String),
 }
@@ -124,6 +154,111 @@ enum Evt {
 // Worker side (background tokio thread). Owns the Config so the GUI never
 // writes config.json behind its back — single writer, no races.
 // ---------------------------------------------------------------------------
+
+/// Classify a message's media. Returns `(kind, downloadable, size_hint)`.
+fn split_media(
+    message: &grammers_client::message::Message,
+) -> Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)> {
+    use grammers_client::media::Media;
+    let media = message.media()?;
+    let triple = match media {
+        Media::Photo(p) => (MsgMedia::Photo, Some(Media::Photo(p.clone())), p.size().map(|s| s as u64)),
+        Media::Document(d) => {
+            let mime = d.mime_type().unwrap_or("").to_string();
+            let name = d.name().map(str::to_string);
+            let size = d.size().map(|s| s as u64);
+            // We can only decode jpeg/png/bmp in-process; show the rest as captions.
+            let decodable = matches!(mime.as_str(), "image/jpeg" | "image/png" | "image/bmp");
+            if decodable {
+                (MsgMedia::Photo, Some(Media::Document(d.clone())), size)
+            } else if mime.starts_with("image/") {
+                let label = name.unwrap_or_else(|| "image".into());
+                (MsgMedia::Label(label), None, None)
+            } else {
+                let label = match (&name, size) {
+                    (Some(n), Some(s)) => format!("{n} ({})", util::human_bytes(s)),
+                    (Some(n), None) => n.clone(),
+                    (None, Some(s)) => format!("{} · {}", mime, util::human_bytes(s)),
+                    (None, None) => {
+                        if mime.is_empty() { "document".into() } else { mime.clone() }
+                    }
+                };
+                (MsgMedia::Label(label), None, None)
+            }
+        }
+        Media::Sticker(_) => (MsgMedia::Label("sticker".into()), None, None),
+        Media::Contact(_) => (MsgMedia::Label("contact".into()), None, None),
+        Media::Poll(_) => (MsgMedia::Label("poll".into()), None, None),
+        Media::Geo(_) | Media::Venue(_) | Media::GeoLive(_) => {
+            (MsgMedia::Label("location".into()), None, None)
+        }
+        Media::Dice(_) => (MsgMedia::Label("dice".into()), None, None),
+        Media::WebPage(_) => (MsgMedia::Label("link preview".into()), None, None),
+        // Media is #[non_exhaustive]; stay honest about unknown variants.
+        _ => (MsgMedia::Label("media".into()), None, None),
+    };
+    Some(triple)
+}
+
+fn media_extension(media: &grammers_client::media::Media) -> &'static str {
+    use grammers_client::media::Media;
+    match media {
+        Media::Photo(_) => "jpg",
+        Media::Document(d) => match d.mime_type().unwrap_or("") {
+            "image/png" => "png",
+            "image/bmp" => "bmp",
+            _ => "jpg",
+        },
+        _ => "bin",
+    }
+}
+
+/// Download an image to `<data_dir>/cache/media/<cache_key>.<ext>` off the
+/// critical path; the GUI gets an `Evt::MediaReady` when it's on disk.
+#[allow(clippy::too_many_arguments)]
+fn spawn_media_download(
+    client: &Client,
+    data_dir: &std::path::Path,
+    account: &str,
+    peer_id: PeerId,
+    msg_id: i32,
+    media: grammers_client::media::Media,
+    size_hint: Option<u64>,
+    evt_tx: &std_mpsc::Sender<Evt>,
+    ctx: &egui::Context,
+) {
+    if let Some(size) = size_hint {
+        if size > MAX_MEDIA_BYTES {
+            return;
+        }
+    }
+    let account_s = account.to_string();
+    let cache_key = media_cache_key(account, peer_id, msg_id);
+    let dir = data_dir.join("cache").join("media");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{cache_key}.{}", media_extension(&media)));
+    if path.exists() {
+        let _ = evt_tx.send(Evt::MediaReady { account: account_s, peer_id, msg_id, cache_key, path });
+        ctx.request_repaint();
+        return;
+    }
+    let client = client.clone();
+    let evt_tx = evt_tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let ok = client.download_media(&media, &path).await.is_ok();
+        let _ = evt_tx.send(Evt::MediaReady {
+            account: account_s,
+            peer_id,
+            msg_id,
+            cache_key,
+            // An empty path signals "download failed" to the GUI.
+            path: if ok { path } else { PathBuf::new() },
+        });
+        ctx.request_repaint();
+    });
+}
+
 
 struct AccountConn {
     client: Client,
@@ -243,7 +378,9 @@ impl Worker {
         let evt_tx = self.evt_tx.clone();
         let ctx = self.ctx.clone();
         let account = name.clone();
+        let data_dir = self.data_dir.clone();
         let update_client = client.clone();
+        let download_client = client.clone();
         if let Some(updates_rx) = updates {
             tokio::spawn(async move {
                 let mut stream = update_client
@@ -255,15 +392,32 @@ impl Worker {
                 loop {
                     match stream.next().await {
                         Ok(Update::NewMessage(message)) => {
+                            let media = split_media(&message);
+                            let msg_id = message.id();
+                            let peer_id = message.peer_id();
                             let msg = MsgItem {
-                                id: message.id(),
+                                id: msg_id,
                                 outgoing: message.outgoing(),
                                 unix: message.date().timestamp(),
                                 text: message.text().to_string(),
+                                media: media.as_ref().map(|(kind, _, _)| kind.clone()),
                             };
+                            if let Some((_, Some(media_obj), size)) = media {
+                                spawn_media_download(
+                                    &download_client,
+                                    &data_dir,
+                                    &account,
+                                    peer_id,
+                                    msg_id,
+                                    media_obj,
+                                    size,
+                                    &evt_tx,
+                                    &ctx,
+                                );
+                            }
                             let _ = evt_tx.send(Evt::Incoming {
                                 account: account.clone(),
-                                peer_id: message.peer_id(),
+                                peer_id,
                                 msg,
                             });
                             ctx.request_repaint();
@@ -327,16 +481,41 @@ impl Worker {
         };
         let mut iter = conn.client.iter_messages(peer_ref).limit(HISTORY_PAGE);
         let mut messages = Vec::with_capacity(HISTORY_PAGE);
+        let mut downloads = Vec::new();
         while let Ok(Some(message)) = iter.next().await {
-            messages.push(MsgItem {
-                id: message.id(),
+            let id = message.id();
+            let media = split_media(&message);
+            let msg = MsgItem {
+                id,
                 outgoing: message.outgoing(),
                 unix: message.date().timestamp(),
                 text: message.text().to_string(),
-            });
+                media: media.as_ref().map(|(kind, _, _)| kind.clone()),
+            };
+            if let Some((_, Some(media_obj), size)) = media {
+                downloads.push((id, media_obj, size));
+            }
+            messages.push(msg);
         }
         messages.reverse(); // newest first from the iterator; show oldest on top
+        // Emit history first so text paints immediately…
         self.emit(Evt::History { account: account.to_string(), peer_id, messages });
+        // …then fetch images in the background (newest 12).
+        if let Some(conn) = self.conns.get(account) {
+            for (msg_id, media, size) in downloads.into_iter().take(12) {
+                spawn_media_download(
+                    &conn.client,
+                    &self.data_dir,
+                    account,
+                    peer_id,
+                    msg_id,
+                    media,
+                    size,
+                    &self.evt_tx,
+                    &self.ctx,
+                );
+            }
+        }
     }
 
     async fn send_text(&mut self, account: &str, peer_id: PeerId, text: String) {
@@ -345,6 +524,7 @@ impl Worker {
                 account: account.to_string(),
                 peer_id,
                 result: Err("account is not connected".into()),
+                source_path: None,
             });
             return;
         };
@@ -353,6 +533,7 @@ impl Worker {
                 account: account.to_string(),
                 peer_id,
                 result: Err("peer not resolved — refresh the chat list".into()),
+                source_path: None,
             });
             return;
         };
@@ -362,10 +543,53 @@ impl Worker {
                 outgoing: true,
                 unix: message.date().timestamp(),
                 text,
+                media: None,
             }),
             Err(e) => Err(e.to_string()),
         };
-        self.emit(Evt::Sent { account: account.to_string(), peer_id, result });
+        self.emit(Evt::Sent { account: account.to_string(), peer_id, result, source_path: None });
+    }
+
+    async fn send_photo(&mut self, account: &str, peer_id: PeerId, path: PathBuf, caption: String) {
+        let Some(conn) = self.conns.get(account) else {
+            self.emit(Evt::Sent {
+                account: account.to_string(),
+                peer_id,
+                result: Err("account is not connected".into()),
+                source_path: None,
+            });
+            return;
+        };
+        let Some(&peer_ref) = conn.peer_refs.get(&peer_id) else {
+            self.emit(Evt::Sent {
+                account: account.to_string(),
+                peer_id,
+                result: Err("peer not resolved — refresh the chat list".into()),
+                source_path: None,
+            });
+            return;
+        };
+        let uploaded = conn.client.upload_file(&path).await.map_err(|e| e.to_string());
+        let result = match uploaded {
+            Ok(uploaded) => {
+                let message = grammers_client::message::InputMessage::new()
+                    .text(caption.clone())
+                    .photo(uploaded);
+                conn.client
+                    .send_message(peer_ref, message)
+                    .await
+                    .map(|message| MsgItem {
+                        id: message.id(),
+                        outgoing: true,
+                        unix: message.date().timestamp(),
+                        text: caption,
+                        media: Some(MsgMedia::Photo),
+                    })
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(format!("upload failed: {e}")),
+        };
+        self.emit(Evt::Sent { account: account.to_string(), peer_id, result, source_path: Some(path) });
     }
 
     fn persist_login(&mut self, name: &str, phone: &str, user: &grammers_client::peer::User) {
@@ -605,6 +829,9 @@ impl Worker {
                 Cmd::SendText { account, peer_id, text } => {
                     self.send_text(&account, peer_id, text).await
                 }
+                Cmd::SendPhoto { account, peer_id, path, caption } => {
+                    self.send_photo(&account, peer_id, path, caption).await
+                }
                 Cmd::BeginLogin { name, phone } => self.begin_login(name, phone).await,
                 Cmd::SubmitCode { name, code } => self.submit_code(name, code).await,
                 Cmd::SubmitPassword { name, password } => self.submit_password(name, password).await,
@@ -670,7 +897,14 @@ pub fn run(data_dir: PathBuf) -> Result<(), telegram::BoxError> {
         options,
         Box::new(move |cc| {
             spawn_worker(data_dir_worker, cmd_rx, evt_tx, cc.egui_ctx.clone());
-            Ok(Box::new(TelegramApp::new(cfg, cmd_tx, evt_rx, data_dir.clone(), show_add)))
+            Ok(Box::new(TelegramApp::new(
+                cfg,
+                cmd_tx,
+                evt_rx,
+                data_dir.clone(),
+                show_add,
+                cc.egui_ctx.clone(),
+            )))
         }),
     )
     .map_err(|e| format!("{e}").into())
@@ -699,6 +933,18 @@ struct TelegramApp {
     cmd_tx: UnboundedSender<Cmd>,
     evt_rx: std_mpsc::Receiver<Evt>,
     data_dir: PathBuf,
+    ctx: egui::Context,
+    /// Decoded inline images, keyed by `media_cache_key(account, peer_id, msg_id)`.
+    textures: HashMap<String, egui::TextureHandle>,
+    /// Images whose download or decode failed (don't spin forever).
+    failed_media: std::collections::HashSet<String>,
+    /// An image staged but not yet sent (composer attachment).
+    pending_attachment: Option<PathBuf>,
+    show_picker: bool,
+    picker_dir: PathBuf,
+    picker_entries: Vec<(String, PathBuf, bool, u64)>,
+    picker_err: Option<String>,
+    picker_show_all: bool,
     sel_account: Option<String>,
     status: HashMap<String, ConnStatus>,
     me: HashMap<String, MeInfo>,
@@ -726,6 +972,7 @@ impl TelegramApp {
         evt_rx: std_mpsc::Receiver<Evt>,
         data_dir: PathBuf,
         show_add: bool,
+        ctx: egui::Context,
     ) -> Self {
         let api_id_draft = cfg.api_id.map(|id| id.to_string()).unwrap_or_default();
         let api_hash_draft = cfg.api_hash.clone().unwrap_or_default();
@@ -752,6 +999,15 @@ impl TelegramApp {
             confirm_remove: None,
             confirm_logout: None,
             last_auto_refresh: HashMap::new(),
+            ctx,
+            textures: HashMap::new(),
+            failed_media: std::collections::HashSet::new(),
+            pending_attachment: None,
+            show_picker: false,
+            picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            picker_entries: Vec::new(),
+            picker_err: None,
+            picker_show_all: false,
         };
         for account in app.cfg.accounts.clone() {
             app.status.insert(account.name.clone(), ConnStatus::Connecting);
@@ -830,8 +1086,17 @@ impl TelegramApp {
                     }
                 }
             }
-            Evt::Sent { account, peer_id, result } => match result {
+            Evt::Sent { account, peer_id, result, source_path } => match result {
                 Ok(msg) => {
+                    // A photo we just sent: cache the local file for rendering.
+                    if let Some(src) = source_path {
+                        let key = media_cache_key(&account, peer_id, msg.id);
+                        let _ = self.decode_into_textures(&key, &src);
+                        // Clear the staged attachment only if it is the one we sent.
+                        if self.pending_attachment.as_deref() == Some(src.as_path()) {
+                            self.pending_attachment = None;
+                        }
+                    }
                     if let Some(chat) = self.chats.get_mut(&(account.clone(), peer_id)) {
                         chat.push(msg);
                         if chat.len() > MAX_CACHED_MESSAGES {
@@ -839,9 +1104,17 @@ impl TelegramApp {
                             chat.drain(..excess);
                         }
                     }
+                    // If the chat was not open the user will re-fetch history on next open.
                 }
                 Err(e) => self.toast = Some((format!("send failed: {e}"), Instant::now())),
             },
+            Evt::MediaReady { cache_key, path, .. } => {
+                if path.as_os_str().is_empty() {
+                    self.failed_media.insert(cache_key);
+                    return;
+                }
+                self.decode_into_textures(&cache_key, &path);
+            }
             Evt::Login { name, state } => match state {
                 LoginEvt::NeedCode => {
                     if self.add.name == name {
@@ -885,8 +1158,38 @@ impl TelegramApp {
         let _ = self.cmd_tx.send(cmd);
     }
 
+    /// Decode an image file into the texture cache (no-op if already cached).
+    fn decode_into_textures(&mut self, key: &str, path: &std::path::Path) -> bool {
+        if self.textures.contains_key(key) {
+            return true;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => {
+                self.failed_media.insert(key.to_string());
+                return false;
+            }
+        };
+        let img = match image::load_from_memory(&bytes) {
+            Ok(i) => i,
+            Err(_) => {
+                self.failed_media.insert(key.to_string());
+                return false;
+            }
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let handle = self
+            .ctx
+            .load_texture(key.to_string(), image, egui::TextureOptions::default());
+        self.textures.insert(key.to_string(), handle);
+        true
+    }
+
     fn select_account(&mut self, name: String) {
         self.sel_account = Some(name.clone());
+        self.pending_attachment = None;
         // Lazily load dialogs the first time the account is picked.
         let online = self.status.get(&name) == Some(&ConnStatus::Online);
         if online && self.dialogs.get(&name).map(|d| d.is_empty()).unwrap_or(true) {
@@ -897,6 +1200,7 @@ impl TelegramApp {
     fn select_peer(&mut self, peer_id: PeerId) {
         if let Some(account) = self.sel_account.clone() {
             self.sel_peer.insert(account.clone(), peer_id);
+            self.pending_attachment = None;
             self.unread.remove(&(account.clone(), peer_id));
             if !self.chats.contains_key(&(account.clone(), peer_id)) {
                 self.send_cmd(Cmd::OpenChat { account, peer_id });
@@ -911,6 +1215,16 @@ impl TelegramApp {
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "chat".to_string())
     }
+}
+
+fn is_image_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
+        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff")
+    )
 }
 
 fn premium_flag(t: &PremiumToggles, key: &str) -> bool {
@@ -1020,6 +1334,23 @@ impl eframe::App for TelegramApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Stage an image dropped from the OS onto the window.
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if let Some(path) = dropped.into_iter().find(|p| is_image_file(p)) {
+            let chat_open = self
+                .sel_account
+                .as_ref()
+                .map(|a| self.sel_peer.get(a).is_some())
+                .unwrap_or(false);
+            if chat_open {
+                self.pending_attachment = Some(path);
+            } else {
+                self.toast = Some(("open a chat first".into(), Instant::now()));
+            }
+        }
+
         self.ui_topbar(ui);
 
         egui::Panel::left("account_list")
@@ -1038,6 +1369,7 @@ impl eframe::App for TelegramApp {
 
         self.ui_settings_window(ui.ctx());
         self.ui_add_window(ui.ctx());
+        self.ui_picker_window(ui.ctx());
         self.ui_toast(ui.ctx());
     }
 }
@@ -1282,41 +1614,84 @@ impl TelegramApp {
         let peer_name = self.selected_peer_name(&account, peer_id);
 
         // Header
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+            ui.add_space(14.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
             let p = ui.painter();
-            paint_avatar(&p, rect.center(), 15.0, &peer_name);
+            paint_avatar(&p, rect.center(), 17.0, &peer_name);
+            ui.add_space(2.0);
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new(truncate(&peer_name, 40)).strong().size(15.0));
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(truncate(&peer_name, 48)).strong().size(16.0));
                 ui.label(egui::RichText::new(format!("via {account}")).weak().small());
             });
         });
+        ui.add_space(4.0);
         ui.separator();
 
+        let has_attachment = self.pending_attachment.is_some();
         // Composer docked at the bottom; history fills the middle.
         egui::Panel::bottom("composer_dock")
             .show_separator_line(false)
-            .exact_size(56.0)
+            .exact_size(if has_attachment { 96.0 } else { 58.0 })
             .show(ui, |ui| {
+                if self.pending_attachment.is_some() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        let name = self
+                            .pending_attachment
+                            .as_ref()
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                            .unwrap_or_else(|| "image".into());
+                        egui::Frame::default()
+                            .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(10, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("Image: {}", truncate(&name, 44))).small());
+                                    if ui.small_button("×").on_hover_text("remove attachment").clicked() {
+                                        self.pending_attachment = None;
+                                    }
+                                });
+                            });
+                    });
+                }
                 ui.horizontal_centered(|ui| {
                     ui.add_space(10.0);
+                    if ui
+                        .button("Attach…")
+                        .on_hover_text("Send an image — or just drop a file anywhere in the window")
+                        .clicked()
+                    {
+                        self.open_picker();
+                    }
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.composer)
                             .hint_text(format!("Message {peer_name}…"))
-                            .desired_width(ui.available_width() - 74.0),
+                            .desired_width(ui.available_width() - 178.0),
                     );
                     let enter = response.lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let can_send = !self.composer.trim().is_empty() || self.pending_attachment.is_some();
                     let send_clicked = ui
-                        .add_enabled(!self.composer.trim().is_empty(), egui::Button::new("Send"))
+                        .add_enabled(
+                            can_send,
+                            egui::Button::new(egui::RichText::new("Send").color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(46, 122, 214)),
+                        )
                         .clicked();
-                    if (enter || send_clicked) && !self.composer.trim().is_empty() {
+                    if enter || send_clicked {
                         let text = self.composer.trim().to_string();
+                        let attachment = self.pending_attachment.take();
                         self.composer.clear();
-                        self.send_cmd(Cmd::SendText { account: account.clone(), peer_id, text });
-                        response.request_focus();
+                        if let Some(path) = attachment {
+                            self.send_cmd(Cmd::SendPhoto { account: account.clone(), peer_id, path, caption: text });
+                        } else if !text.is_empty() {
+                            self.send_cmd(Cmd::SendText { account: account.clone(), peer_id, text });
+                        }
                     }
                     ui.add_space(6.0);
                 });
@@ -1334,23 +1709,227 @@ impl TelegramApp {
                         ui.label(egui::RichText::new("No messages yet — say hi.").weak());
                     });
                 }
+                let text_color = ui.visuals().text_color();
+                let mut last_day: Option<chrono::NaiveDate> = None;
                 for message in &messages {
-                    let outgoing = message.outgoing;
-                    if outgoing {
+                    let day = chrono::DateTime::from_timestamp(message.unix, 0)
+                        .map(|dt| dt.with_timezone(&chrono::Local).date_naive());
+                    if day != last_day {
+                        if let Some(d) = day {
+                            day_chip(ui, &day_label(d));
+                        }
+                        last_day = day;
+                    }
+                    if message.outgoing {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(12.0);
-                            bubble(ui, message, true, ui.visuals().text_color());
+                            ui.add_space(14.0);
+                            self.ui_bubble(ui, message, true, text_color, &account, peer_id);
                         });
                     } else {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add_space(12.0);
-                            bubble(ui, message, false, ui.visuals().text_color());
+                            ui.add_space(14.0);
+                            self.ui_bubble(ui, message, false, text_color, &account, peer_id);
                         });
                     }
-                    ui.add_space(2.0);
+                    ui.add_space(3.0);
                 }
                 ui.add_space(6.0);
             });
+    }
+
+    /// Render one chat bubble with readable typography and inline images.
+    fn ui_bubble(
+        &mut self,
+        ui: &mut egui::Ui,
+        message: &MsgItem,
+        outgoing: bool,
+        text_color: egui::Color32,
+        account: &str,
+        peer_id: PeerId,
+    ) {
+        let (fill, time_color) = if outgoing {
+            (
+                egui::Color32::from_rgb(47, 84, 132),
+                egui::Color32::from_rgb(170, 196, 224),
+            )
+        } else {
+            (
+                ui.visuals().widgets.noninteractive.bg_fill,
+                egui::Color32::from_gray(140),
+            )
+        };
+        let stroke = if outgoing {
+            egui::Stroke::NONE
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_gray(72))
+        };
+        egui::Frame::default()
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(14.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width(360.0);
+                    match &message.media {
+                        Some(MsgMedia::Photo) => {
+                            let key = media_cache_key(account, peer_id, message.id);
+                            if let Some(tex) = self.textures.get(&key) {
+                                let size = tex.size_vec2();
+                                let scale = (300.0 / size.x).min(220.0 / size.y).min(1.0);
+                                ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), size * scale))
+                                        .corner_radius(8.0),
+                                );
+                            } else if self.failed_media.contains(&key) {
+                                ui.label(
+                                    egui::RichText::new("[image unavailable]")
+                                        .italics()
+                                        .weak()
+                                        .small(),
+                                );
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(egui::RichText::new("loading image…").weak().small());
+                                });
+                            }
+                        }
+                        Some(MsgMedia::Label(label)) => {
+                            ui.label(
+                                egui::RichText::new(format!("[{label}]"))
+                                    .italics()
+                                    .color(time_color)
+                                    .size(12.5),
+                            );
+                        }
+                        None => {}
+                    }
+                    if !message.text.is_empty() {
+                        let color = if outgoing { egui::Color32::WHITE } else { text_color };
+                        ui.label(egui::RichText::new(&message.text).color(color).size(13.5));
+                    }
+                    ui.label(
+                        egui::RichText::new(format_msg_time(message.unix))
+                            .small()
+                            .color(time_color),
+                    );
+                });
+            });
+    }
+
+    /// Open the in-app image picker for the composer.
+    fn open_picker(&mut self) {
+        self.show_picker = true;
+        self.refresh_picker();
+    }
+
+    fn refresh_picker(&mut self) {
+        self.picker_entries.clear();
+        self.picker_err = None;
+        let read = std::fs::read_dir(&self.picker_dir);
+        match read {
+            Ok(entries) => {
+                let mut items: Vec<(String, PathBuf, bool, u64)> = Vec::new();
+                for e in entries.flatten() {
+                    let path = e.path();
+                    let is_dir = path.is_dir();
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !is_dir && !self.picker_show_all && !is_image_file(&path) {
+                        continue;
+                    }
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    items.push((name, path, is_dir, size));
+                }
+                items.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+                self.picker_entries = items;
+            }
+            Err(e) => self.picker_err = Some(format!("{}: {e}", self.picker_dir.display())),
+        }
+    }
+
+    fn ui_picker_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_picker;
+        egui::Window::new("Send image")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(540.0)
+            .default_height(440.0)
+            .show(ctx, |ui| {
+                let can_attach = self
+                    .sel_account
+                    .as_ref()
+                    .map(|a| self.sel_peer.get(a).is_some())
+                    .unwrap_or(false);
+                ui.label(egui::RichText::new(self.picker_dir.display().to_string()).weak().small());
+                ui.horizontal(|ui| {
+                    if ui.button("..").on_hover_text("parent directory").clicked() {
+                        if let Some(parent) = self.picker_dir.parent().map(|p| p.to_path_buf()) {
+                            self.picker_dir = parent;
+                            self.refresh_picker();
+                        }
+                    }
+                    if ui.button("~").on_hover_text("home directory").clicked() {
+                        if let Some(home) = std::env::var_os("HOME") {
+                            self.picker_dir = PathBuf::from(home);
+                            self.refresh_picker();
+                        }
+                    }
+                    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                        for label in ["Pictures", "Downloads", "Desktop"] {
+                            let candidate = home.join(label);
+                            if candidate.is_dir() && ui.button(label).clicked() {
+                                self.picker_dir = candidate;
+                                self.refresh_picker();
+                            }
+                        }
+                    }
+                    let mut show_all = self.picker_show_all;
+                    if ui.checkbox(&mut show_all, "show all files").changed() {
+                        self.picker_show_all = show_all;
+                        self.refresh_picker();
+                    }
+                });
+                if let Some(err) = &self.picker_err {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 110), err.as_str());
+                }
+                ui.separator();
+                if !can_attach {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 176, 46),
+                        "open a chat first, then pick an image",
+                    );
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let entries = self.picker_entries.clone();
+                    if entries.is_empty() {
+                        ui.add_space(12.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new("no images here").weak());
+                            ui.label(egui::RichText::new("tick 'show all files' or navigate elsewhere").weak().small());
+                        });
+                    }
+                    for (name, path, is_dir, size) in entries {
+                        if is_dir {
+                            if ui.selectable_label(false, format!("{name}/")).clicked() {
+                                self.picker_dir = path;
+                                self.refresh_picker();
+                            }
+                        } else {
+                            let label = format!("{name}  ·  {}", util::human_bytes(size));
+                            if ui.selectable_label(false, label).clicked() {
+                                if can_attach {
+                                    self.pending_attachment = Some(path);
+                                    self.show_picker = false;
+                                } else {
+                                    self.toast = Some(("open a chat first".into(), Instant::now()));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        self.show_picker = open;
     }
 
     fn ui_welcome(&mut self, ui: &mut egui::Ui) {
@@ -1409,34 +1988,35 @@ fn paint_avatar(painter: &egui::Painter, center: egui::Pos2, radius: f32, name: 
     );
 }
 
-fn bubble(ui: &mut egui::Ui, message: &MsgItem, outgoing: bool, text_color: egui::Color32) {
-    let fill = if outgoing {
-        egui::Color32::from_rgb(46, 92, 160)
-    } else {
-        ui.visuals().widgets.noninteractive.bg_fill
-    };
-    let time_color = if outgoing {
-        egui::Color32::from_rgb(198, 214, 236)
-    } else {
-        egui::Color32::from_gray(140)
-    };
-    egui::Frame::default()
-        .fill(fill)
-        .inner_margin(egui::Margin::symmetric(10, 7))
-        .corner_radius(12.0)
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width(330.0);
-                let color = if outgoing { egui::Color32::WHITE } else { text_color };
-                ui.label(egui::RichText::new(&message.text).color(color));
-                ui.label(
-                    egui::RichText::new(format_msg_time(message.unix))
-                        .small()
-                        .color(time_color),
-                );
-            });
-        });
+fn day_label(d: chrono::NaiveDate) -> String {
+    let today = chrono::Local::now().date_naive();
+    if d == today {
+        return "Today".into();
+    }
+    if let Some(yesterday) = today.pred_opt() {
+        if d == yesterday {
+            return "Yesterday".into();
+        }
+    }
+    d.format("%d %B %Y").to_string()
 }
+
+fn day_chip(ui: &mut egui::Ui, label: &str) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let approx = 36.0 + label.chars().count() as f32 * 6.2;
+        ui.add_space(((ui.available_width() - approx) / 2.0).max(0.0));
+        egui::Frame::default()
+            .fill(egui::Color32::from_gray(50))
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::symmetric(12, 3))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(label).small().color(egui::Color32::from_gray(208)));
+            });
+    });
+    ui.add_space(2.0);
+}
+
 
 // ---------------- windows & toast ----------------
 
