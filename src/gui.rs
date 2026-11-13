@@ -1928,7 +1928,7 @@ impl TelegramApp {
         let tex_size = tex.size_vec2();
         let tex_id = tex.id();
 
-        let screen = ctx.input(|i| i.screen_rect());
+        let screen = ctx.input(|i| i.content_rect());
         let fit = (screen.width() * 0.90 / tex_size.x.max(1.0))
             .min(screen.height() * 0.86 / tex_size.y.max(1.0))
             .min(1.0);
