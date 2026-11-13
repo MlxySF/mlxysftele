@@ -33,9 +33,10 @@ def main() -> int:
         print("usage: annotate.py <log>", file=sys.stderr)
         return 2
 
+    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
     try:
         with open(sys.argv[1], "r", errors="replace") as fh:
-            lines = fh.read().splitlines()
+            lines = [ansi_re.sub("", line) for line in fh.read().splitlines()]
     except OSError as exc:
         print(f"::error::annotate.py could not read {sys.argv[1]}: {exc}")
         return 0
