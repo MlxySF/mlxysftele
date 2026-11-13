@@ -57,7 +57,8 @@ native binding):
 
 ## Quick start
 
-Prerequisites: Rust **1.85+** and network access to Telegram's datacenters.
+Prerequisites: Rust **1.85+** and network access to `github.com` (git-pinned
+grammers), `crates.io`, and Telegram's datacenters.
 
 ```sh
 git clone https://github.com/MlxySF/mlxysftele.git
@@ -199,14 +200,17 @@ Software-wise there is no cap. Reality-wise:
 
 ```sh
 cargo fmt           # formatting
-cargo check         # types (build requires crates.io access)
-cargo test          # unit tests (config registry round-trip)
+cargo check         # types (needs github.com + crates.io access)
+cargo test          # unit tests
 cargo build --release
 ```
 
-`Cargo.lock` is generated on your first build and is intentionally not
-committed yet — CI pinning lands with the v0.2 packaging milestone
-(see `docs/ROADMAP.md`).
+Grammers is pinned to an exact git commit (the crates.io v0.8.0 release
+predates the module reorganization this crate uses), so building requires
+network access to `github.com` and `crates.io`. Builds and tests are
+verified on every push by GitHub Actions (`.github/workflows/ci.yml`) —
+including a smoke test of the release binary. `Cargo.lock` is generated
+on your first build; commit it for reproducible builds.
 
 Layout: `src/main.rs` (CLI) · `telegram.rs` (engine) · `daemon.rs` (hub) ·
 `config.rs` (atomic registry) · `premium.rs` (local premium flags) ·
