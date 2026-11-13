@@ -17,6 +17,7 @@ mod lowmem;
 mod premium;
 mod telegram;
 mod util;
+mod video;
 
 use std::collections::HashMap;
 use std::process::ExitCode;

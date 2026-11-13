@@ -37,6 +37,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::config::{AccountMeta, Config};
 use crate::premium::{self, PremiumToggles};
 use crate::telegram;
+use crate::video::VideoPlayer;
 use crate::util;
 use crate::{log_err, log_warn};
 
@@ -60,6 +61,10 @@ enum Cmd {
     SendText { account: String, peer_id: PeerId, text: String },
     /// Send a local image file as a photo; `caption` may be empty.
     SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String },
+    /// Download a video message for inline playback (user-tapped; never automatic).
+    OpenVideo { account: String, peer_id: PeerId, msg_id: i32 },
+    /// GUI → worker echo of `Evt::StashMedia`; stashes the raw Media handle.
+    StashMedia { cache_key: String, media: grammers_client::media::Media },
     BeginLogin { name: String, phone: String },
     SubmitCode { name: String, code: String },
     SubmitPassword { name: String, password: String },
@@ -84,6 +89,8 @@ enum MsgMedia {
     /// An image Telegram gave us (photo / image document / webp sticker);
     /// downloaded to the local cache for inline rendering.
     Photo,
+    /// A video document; tapped to download & play inline (embedded libmpv).
+    Video(String),
     /// Anything else — rendered as a muted caption label.
     Label(String),
 }
@@ -154,8 +161,19 @@ enum Evt {
         /// the GUI can cache it for display without re-downloading.
         source_path: Option<PathBuf>,
     },
+    /// Hand a video Media handle to the GUI, which echoes it back as
+    /// `Cmd::StashMedia` (the worker updater cannot borrow `self`).
+    StashMedia { cache_key: String, media: grammers_client::media::Media },
     /// An image finished downloading (or failed — empty `path`).
-    MediaReady { account: String, peer_id: PeerId, msg_id: i32, cache_key: String, path: PathBuf },
+    MediaReady {
+        account: String,
+        peer_id: PeerId,
+        msg_id: i32,
+        cache_key: String,
+        path: PathBuf,
+        /// Photo vs video — decides whether the GUI decodes a texture or opens the player.
+        kind: MsgMedia,
+    },
     Login { name: String, state: LoginEvt },
     Toast(String),
 }
@@ -181,6 +199,14 @@ fn split_media(
             let decodable = matches!(mime.as_str(), "image/jpeg" | "image/png" | "image/bmp");
             if decodable {
                 (MsgMedia::Photo, Some(Media::Document(d.clone())), size)
+            } else if mime.starts_with("video/") {
+                let label = match (&name, size) {
+                    (Some(n), Some(s)) => format!("{n} ({})", util::human_bytes(s)),
+                    (Some(n), None) => n.clone(),
+                    (None, Some(s)) => format!("{} · {}", mime, util::human_bytes(s)),
+                    (None, None) => "video".to_string(),
+                };
+                (MsgMedia::Video(label), Some(Media::Document(d.clone())), size)
             } else if mime.starts_with("image/") {
                 let label = name.unwrap_or_else(|| "image".into());
                 (MsgMedia::Label(label), None, None)
@@ -210,18 +236,67 @@ fn split_media(
     Some(triple)
 }
 
-fn media_extension(media: &grammers_client::media::Media) -> &'static str {
-    use grammers_client::media::Media;
-    match media {
-        Media::Photo(_) => "jpg",
-        Media::Document(d) => match d.mime_type().unwrap_or("") {
-            "image/png" => "png",
-            "image/bmp" => "bmp",
-            _ => "jpg",
-        },
-        _ => "bin",
+/// Format seconds as `m:ss` (or `h:mm:ss` past an hour) for the video HUD.
+fn format_mmss(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "0:00".to_string();
+    }
+    let total = seconds as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
     }
 }
+
+fn media_extension(media: &grammers_client::media::Media) -> String {
+    use grammers_client::media::Media;
+    match media {
+        Media::Photo(_) => "jpg".into(),
+        Media::Document(d) => {
+            // Prefer the original filename extension (keeps mkv/mov/… honest).
+            let from_name = d
+                .name()
+                .and_then(|n| std::path::Path::new(n).extension().map(|e| e.to_string_lossy().into_owned()))
+                .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()));
+            if let Some(ext) = from_name {
+                return ext.to_ascii_lowercase();
+            }
+            match d.mime_type().unwrap_or("") {
+                "image/png" => "png",
+                "image/bmp" => "bmp",
+                "video/webm" => "webm",
+                "video/x-matroska" => "mkv",
+                "video/quicktime" => "mov",
+                "video/x-msvideo" => "avi",
+                "video/mpeg" => "mpg",
+                "video/3gpp" => "3gp",
+                "video/ogg" => "ogv",
+                _ => "mp4",
+            }
+            .into()
+        }
+        _ => "bin".into(),
+    }
+}
+
+fn video_label_for(media: &grammers_client::media::Media) -> String {
+    use grammers_client::media::Media;
+    match media {
+        Media::Document(d) => d
+            .name()
+            .map(str::to_string)
+            .or_else(|| d.mime_type().map(|m| m.to_string()))
+            .unwrap_or_else(|| "video".into()),
+        _ => "video".into(),
+    }
+}
+
+/// Largest video we will auto-start downloading (honest cap; bigger files toast instead).
+const MAX_VIDEO_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Download an image to `<data_dir>/cache/media/<cache_key>.<ext>` off the
 /// critical path; the GUI gets an `Evt::MediaReady` when it's on disk.
@@ -236,9 +311,10 @@ fn spawn_media_download(
     size_hint: Option<u64>,
     evt_tx: &std_mpsc::Sender<Evt>,
     ctx: &egui::Context,
+    cap_bytes: u64,
 ) {
     if let Some(size) = size_hint {
-        if size > MAX_MEDIA_BYTES {
+        if size > cap_bytes {
             return;
         }
     }
@@ -246,9 +322,17 @@ fn spawn_media_download(
     let cache_key = media_cache_key(account, peer_id, msg_id);
     let dir = data_dir.join("cache").join("media");
     let _ = std::fs::create_dir_all(&dir);
+    let kind: MsgMedia = match &media {
+        grammers_client::media::Media::Document(d)
+            if d.mime_type().unwrap_or("").starts_with("video/") =>
+        {
+            MsgMedia::Video(video_label_for(&media))
+        }
+        _ => MsgMedia::Photo,
+    };
     let path = dir.join(format!("{cache_key}.{}", media_extension(&media)));
     if path.exists() {
-        let _ = evt_tx.send(Evt::MediaReady { account: account_s, peer_id, msg_id, cache_key, path });
+        let _ = evt_tx.send(Evt::MediaReady { account: account_s, peer_id, msg_id, cache_key, path, kind });
         ctx.request_repaint();
         return;
     }
@@ -264,6 +348,7 @@ fn spawn_media_download(
             cache_key,
             // An empty path signals "download failed" to the GUI.
             path: if ok { path } else { PathBuf::new() },
+            kind,
         });
         ctx.request_repaint();
     });
@@ -299,6 +384,8 @@ struct Worker {
     ctx: egui::Context,
     conns: HashMap<String, AccountConn>,
     pending_logins: HashMap<String, PendingLogin>,
+    /// Kept-alive raw video Media handles for on-demand downloads (capped).
+    media_objects: HashMap<String, grammers_client::media::Media>,
 }
 
 impl Worker {
@@ -412,18 +499,32 @@ impl Worker {
                                 text: message.text().to_string(),
                                 media: media.as_ref().map(|(kind, _, _)| kind.clone()),
                             };
-                            if let Some((_, Some(media_obj), size)) = media {
-                                spawn_media_download(
-                                    &download_client,
-                                    &data_dir,
-                                    &account,
-                                    peer_id,
-                                    msg_id,
-                                    media_obj,
-                                    size,
-                                    &evt_tx,
-                                    &ctx,
-                                );
+                            if let Some((kind, obj, size)) = media {
+                                let cache_key = media_cache_key(&account, peer_id, msg_id);
+                                match kind {
+                                    MsgMedia::Photo => {
+                                        if let Some(o) = obj {
+                                            spawn_media_download(
+                                                &download_client,
+                                                &data_dir,
+                                                &account,
+                                                peer_id,
+                                                msg_id,
+                                                o,
+                                                size,
+                                                &evt_tx,
+                                                &ctx,
+                                                MAX_MEDIA_BYTES,
+                                            );
+                                        }
+                                    }
+                                    MsgMedia::Video(_) => {
+                                        if let Some(o) = obj {
+                                            let _ = evt_tx.send(Evt::StashMedia { cache_key, media: o });
+                                        }
+                                    }
+                                    MsgMedia::Label(_) => {}
+                                }
                             }
                             let _ = evt_tx.send(Evt::Incoming {
                                 account: account.clone(),
@@ -502,8 +603,25 @@ impl Worker {
                 text: message.text().to_string(),
                 media: media.as_ref().map(|(kind, _, _)| kind.clone()),
             };
-            if let Some((_, Some(media_obj), size)) = media {
-                downloads.push((id, media_obj, size));
+            if let Some((kind, obj, size)) = media {
+                let cache_key = media_cache_key(account, peer_id, id);
+                match kind {
+                    // Photos auto-download (small); videos wait for a tap.
+                    MsgMedia::Photo => {
+                        if let Some(o) = obj {
+                            downloads.push((id, o, size));
+                        }
+                    }
+                    MsgMedia::Video(_) => {
+                        if let Some(o) = obj {
+                            if self.media_objects.len() >= 96 {
+                                self.media_objects.clear();
+                            }
+                            self.media_objects.insert(cache_key, o);
+                        }
+                    }
+                    MsgMedia::Label(_) => {}
+                }
             }
             messages.push(msg);
         }
@@ -523,6 +641,7 @@ impl Worker {
                     size,
                     &self.evt_tx,
                     &self.ctx,
+                    MAX_MEDIA_BYTES,
                 );
             }
         }
@@ -600,6 +719,66 @@ impl Worker {
             Err(e) => Err(format!("upload failed: {e}")),
         };
         self.emit(Evt::Sent { account: account.to_string(), peer_id, result, source_path: Some(path) });
+    }
+
+    /// Kick off (or fast-path) an embedded playback for a video message.
+    async fn open_video(&mut self, account: &str, peer_id: PeerId, msg_id: i32) {
+        let Some(client) = self.conns.get(account).map(|c| c.client.clone()) else {
+            self.emit(Evt::Toast("account is not connected".into()));
+            return;
+        };
+        let cache_key = media_cache_key(account, peer_id, msg_id);
+        let dir = self.data_dir.join("cache").join("media");
+        // Fast path: already downloaded under any known extension.
+        for ext in ["mp4", "webm", "mkv", "mov", "avi", "mpg", "3gp", "ogv", "mpeg", "bin"] {
+            let candidate = dir.join(format!("{cache_key}.{ext}"));
+            if candidate.exists() {
+                self.emit(Evt::MediaReady {
+                    account: account.to_string(),
+                    peer_id,
+                    msg_id,
+                    cache_key,
+                    path: candidate,
+                    kind: MsgMedia::Video(String::new()),
+                });
+                return;
+            }
+        }
+        let Some(media) = self.media_objects.get(&cache_key).cloned() else {
+            self.emit(Evt::Toast(
+                "video unavailable — reopen the chat (media list was refreshed)".into(),
+            ));
+            return;
+        };
+        let size_hint = match &media {
+            grammers_client::media::Media::Document(d) => d.size().map(|s| s as u64),
+            _ => None,
+        };
+        if let Some(size) = size_hint {
+            if size > MAX_VIDEO_BYTES {
+                self.emit(Evt::Toast(format!(
+                    "video is {} — too large to download here (cap {})",
+                    util::human_bytes(size),
+                    util::human_bytes(MAX_VIDEO_BYTES),
+                )));
+                return;
+            }
+            self.emit(Evt::Toast(format!("downloading video ({})…", util::human_bytes(size))));
+        } else {
+            self.emit(Evt::Toast("downloading video…".into()));
+        }
+        spawn_media_download(
+            &client,
+            &self.data_dir,
+            account,
+            peer_id,
+            msg_id,
+            media,
+            size_hint,
+            &self.evt_tx,
+            &self.ctx,
+            MAX_VIDEO_BYTES,
+        );
     }
 
     fn persist_login(&mut self, name: &str, phone: &str, user: &grammers_client::peer::User) {
@@ -842,6 +1021,15 @@ impl Worker {
                 Cmd::SendPhoto { account, peer_id, path, caption } => {
                     self.send_photo(&account, peer_id, path, caption).await
                 }
+                Cmd::OpenVideo { account, peer_id, msg_id } => {
+                    self.open_video(&account, peer_id, msg_id).await
+                }
+                Cmd::StashMedia { cache_key, media } => {
+                    if self.media_objects.len() >= 96 {
+                        self.media_objects.clear();
+                    }
+                    self.media_objects.insert(cache_key, media);
+                }
                 Cmd::BeginLogin { name, phone } => self.begin_login(name, phone).await,
                 Cmd::SubmitCode { name, code } => self.submit_code(name, code).await,
                 Cmd::SubmitPassword { name, password } => self.submit_password(name, password).await,
@@ -879,7 +1067,7 @@ fn spawn_worker(
                 }
             };
             let cfg = Config::load(&data_dir).unwrap_or_else(|_| Config::default());
-            let worker = Worker { data_dir, cfg, evt_tx, ctx, conns: HashMap::new(), pending_logins: HashMap::new() };
+            let worker = Worker { data_dir, cfg, evt_tx, ctx, conns: HashMap::new(), pending_logins: HashMap::new(), media_objects: HashMap::new() };
             rt.block_on(worker.run(cmd_rx));
         })
         .expect("failed to spawn worker thread");
@@ -952,6 +1140,11 @@ struct TelegramApp {
     pending_attachment: Option<PathBuf>,
     /// Full-screen image viewer, if open.
     viewer: Option<ViewerState>,
+    /// Embedded video player (libmpv), if any.
+    video: Option<VideoPlayer>,
+    /// Set when the user tapped a video that is not yet downloaded; holds the
+    /// cache_key we're waiting on.
+    pending_video_open: Option<String>,
     show_picker: bool,
     picker_dir: PathBuf,
     picker_entries: Vec<(String, PathBuf, bool, u64)>,
@@ -1016,6 +1209,8 @@ impl TelegramApp {
             failed_media: std::collections::HashSet::new(),
             pending_attachment: None,
             viewer: None,
+            video: None,
+            pending_video_open: None,
             show_picker: false,
             picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             picker_entries: Vec::new(),
@@ -1121,12 +1316,39 @@ impl TelegramApp {
                 }
                 Err(e) => self.toast = Some((format!("send failed: {e}"), Instant::now())),
             },
-            Evt::MediaReady { cache_key, path, .. } => {
-                if path.as_os_str().is_empty() {
-                    self.failed_media.insert(cache_key);
-                    return;
+            Evt::StashMedia { cache_key, media } => {
+                // Echo back to the worker; it owns the raw Media handles.
+                self.send_cmd(Cmd::StashMedia { cache_key, media });
+            }
+            Evt::MediaReady { cache_key, path, kind, .. } => {
+                match kind {
+                    MsgMedia::Video(_) => {
+                        if self.pending_video_open.as_deref() == Some(cache_key.as_str()) {
+                            self.pending_video_open = None;
+                            if path.as_os_str().is_empty() {
+                                self.toast = Some(("video download failed".into(), Instant::now()));
+                            } else {
+                                let title = path
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "video".to_string());
+                                match VideoPlayer::open(&path, &title) {
+                                    Ok(player) => self.video = Some(player),
+                                    Err(e) => {
+                                        self.toast = Some((format!("video failed: {e}"), Instant::now()))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if path.as_os_str().is_empty() {
+                            self.failed_media.insert(cache_key);
+                            return;
+                        }
+                        self.decode_into_textures(&cache_key, &path);
+                    }
                 }
-                self.decode_into_textures(&cache_key, &path);
             }
             Evt::Login { name, state } => match state {
                 LoginEvt::NeedCode => {
@@ -1354,6 +1576,8 @@ impl eframe::App for TelegramApp {
         if esc {
             if self.viewer.take().is_some() {
                 // viewer closed
+            } else if self.video.take().is_some() {
+                // video player closed
             } else if self.show_picker {
                 self.show_picker = false;
             } else if self.show_settings {
@@ -1420,10 +1644,15 @@ impl eframe::App for TelegramApp {
 
         egui::CentralPanel::default().show(ui, |ui| self.ui_chat_view(ui));
 
+        if self.video.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         self.ui_settings_window(ui.ctx());
         self.ui_add_window(ui.ctx());
         self.ui_picker_window(ui.ctx());
         self.ui_viewer(ui.ctx());
+        self.ui_video(ui.ctx());
         self.ui_toast(ui.ctx());
     }
 }
@@ -1818,6 +2047,7 @@ impl TelegramApp {
             egui::Stroke::new(1.0, egui::Color32::from_gray(72))
         };
         let mut open_viewer: Option<ViewerState> = None;
+        let mut open_video: Option<(String, PeerId, i32)> = None;
         egui::Frame::default()
             .fill(fill)
             .stroke(stroke)
@@ -1859,6 +2089,28 @@ impl TelegramApp {
                                 });
                             }
                         }
+                        Some(MsgMedia::Video(label)) => {
+                            let key = media_cache_key(account, peer_id, message.id);
+                            let busy = self.pending_video_open.as_deref() == Some(key.as_str());
+                            if busy {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(egui::RichText::new("downloading video…").weak().small());
+                                });
+                            } else {
+                                let card = egui::Button::new(
+                                    egui::RichText::new(format!("▶  {label}")).size(13.0),
+                                )
+                                .min_size(egui::vec2(240.0, 64.0));
+                                let resp = ui
+                                    .add(card)
+                                    .on_hover_text("download & play inline");
+                                if resp.clicked() {
+                                    self.pending_video_open = Some(key.clone());
+                                    open_video = Some((account.to_string(), peer_id, message.id));
+                                }
+                            }
+                        }
                         Some(MsgMedia::Label(label)) => {
                             ui.label(
                                 egui::RichText::new(format!("[{label}]"))
@@ -1882,6 +2134,9 @@ impl TelegramApp {
             });
         if let Some(viewer) = open_viewer {
             self.viewer = Some(viewer);
+        }
+        if let Some((account, peer_id, msg_id)) = open_video {
+            self.send_cmd(Cmd::OpenVideo { account, peer_id, msg_id });
         }
     }
 
@@ -2014,6 +2269,140 @@ impl TelegramApp {
         if !close {
             self.viewer = Some(viewer);
         }
+    }
+
+    /// Full-screen embedded video player (libmpv): Esc/× closes, the picture
+    /// scales to fit, and the bottom bar carries play/pause, ±10 s skip, a
+    /// seek slider and a volume slider.
+    fn ui_video(&mut self, ctx: &egui::Context) {
+        // Take so we can drop it inside this call if it went bad.
+        let Some(mut player) = self.video.take() else { return };
+        player.refresh_frame(ctx);
+
+        let screen = ctx.input(|i| i.content_rect());
+        let tex_id = player.texture_id();
+        let tex_size = player.size_vec2().unwrap_or(egui::vec2(640.0, 360.0));
+        let title = if player.title.is_empty() {
+            player.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into())
+        } else {
+            player.title.clone()
+        };
+
+        let mut close = false;
+        let mut toggle_pause = false;
+        egui::Area::new(egui::Id::new("video_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.left_top())
+            .show(ctx, |ui| {
+                let response = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(235));
+
+                // Fit the frame, preserving aspect.
+                let fit = (screen.width() * 0.92 / tex_size.x.max(1.0))
+                    .min(screen.height() * 0.78 / tex_size.y.max(1.0))
+                    .min(1.0);
+                let size = tex_size * fit;
+                let video_rect = egui::Rect::from_center_size(
+                    egui::pos2(screen.center().x, screen.min.y + screen.height() * 0.42),
+                    size,
+                );
+                if let Some(tex_id) = tex_id {
+                    ui.painter().image(
+                        tex_id,
+                        video_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    ui.painter().text(
+                        video_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "loading video…",
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::from_gray(200),
+                    );
+                }
+                // Click on the picture/backdrop toggles play/pause.
+                if response.clicked() {
+                    toggle_pause = true;
+                }
+            });
+        if toggle_pause {
+            let paused = player.is_paused();
+            player.set_paused(!paused);
+        }
+
+        // Top bar: title left, close right.
+        egui::Area::new(egui::Id::new("video_topbar"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&title)
+                            .small()
+                            .color(egui::Color32::from_gray(210)),
+                    );
+                    if ui.button("×").on_hover_text("close (Esc)").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        // Bottom control bar.
+        egui::Area::new(egui::Id::new("video_controls"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let paused = player.is_paused();
+                    let eof = player.eof_reached();
+                    if eof {
+                        if ui.button("↻").on_hover_text("replay").clicked() {
+                            player.replay();
+                        }
+                    } else if ui.button(if paused { "▶" } else { "❚❚" }).on_hover_text(if paused { "play" } else { "pause" }).clicked() {
+                        player.set_paused(!paused);
+                    }
+                    if ui.button("−10s").clicked() {
+                        player.skip_relative(-10.0);
+                    }
+                    if ui.button("+10s").clicked() {
+                        player.skip_relative(10.0);
+                    }
+
+                    let pos = player.time_pos().unwrap_or(0.0);
+                    let dur = player.duration().unwrap_or(0.0).max(1.0);
+                    ui.label(egui::RichText::new(format_mmss(pos)).small().monospace());
+                    let mut slider = pos.clamp(0.0, dur);
+                    let resp = ui.add(
+                        egui::Slider::new(&mut slider, 0.0..=dur).show_value(false)
+                    );
+                    if resp.drag_stopped() {
+                        player.seek_to(slider);
+                    }
+                    ui.label(egui::RichText::new(format_mmss(dur)).small().monospace());
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("🔊").small());
+                    let mut volume = player.volume().unwrap_or(100.0);
+                    if ui
+                        .add(egui::Slider::new(&mut volume, 0.0..=100.0).show_value(false))
+                        .changed()
+                    {
+                        player.set_volume(volume);
+                    }
+                });
+            });
+
+        if !player.last_error().is_empty() {
+            self.toast = Some((format!("video: {}", player.last_error()), Instant::now()));
+        }
+
+        if !close {
+            self.video = Some(player);
+        }
+        // When closing, the VideoPlayer is dropped here → mpv shuts down.
     }
 
     /// Open the in-app image picker for the composer.

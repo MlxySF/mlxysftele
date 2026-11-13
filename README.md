@@ -56,9 +56,19 @@ native binding):
   Esc to close). Images land in `<data_dir>/cache/media/` (or `cache/paste/`)
   and are rendered from that cache; anything larger than 24 MB or
   undecodable (webp/gif/…) shows as a plain caption instead of pretending.
-- **Keyboard flow** — Esc closes, in order: the image viewer, the file
-  picker, Settings, the add-account window, and finally the open chat (back
-  to "pick a chat").
+- **Embedded video playback (libmpv)** — incoming video messages render as a
+  "▶" card in the chat; tap it to download (512 MB cap) and play right inside
+  the window. Playback is ZapFast-style: hardware decode off, software frames
+  rendered by libmpv straight into the egui texture cache at ≤1280 px wide,
+  with audio out through whatever audio system libmpv finds (pulse/pipewire/
+  alsa). Controls: click the picture to play/pause, ±10 s skip, seek bar,
+  volume slider, replay at end of file, Esc/× to close. Nothing plays
+  automatically — videos download only when you tap the card. Building requires
+  libmpv at link time: `sudo apt install libmpv-dev` (Debian/Ubuntu). Video
+  files land in `<data_dir>/cache/media/` like photos.
+- **Keyboard flow** — Esc closes, in order: the image viewer, the video
+  player, the file picker, Settings, the add-account window, and finally the
+  open chat (back to "pick a chat").
 - **Readable chat view** — day-separator chips (Today/Yesterday/date),
   distinct outgoing/incoming bubble tints with sensible contrast, larger
   message text, and quick timestamps.
@@ -78,7 +88,8 @@ native binding):
 
 Prerequisites: Rust **1.95+** and network access to `github.com` (git-pinned
 grammers), `crates.io`, and Telegram's datacenters. On Linux you need the
-usual GUI build libraries, e.g. `sudo apt install libwayland-dev libxkbcommon-dev`.
+usual GUI build libraries, e.g. `sudo apt install libwayland-dev libxkbcommon-dev libmpv-dev`
+(libmpv is what the embedded video player links against).
 
 ```sh
 git clone https://github.com/MlxySF/mlxysftele.git
