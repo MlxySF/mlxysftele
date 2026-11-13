@@ -49,11 +49,16 @@ native binding):
   streams per account, unread badges, search filter, per-account status dots,
   `PRO` badge for genuine server premium. Runs on its own background tokio
   runtime; the UI never blocks on the network.
-- **Images in chat** — send photos (attach button or just drop an image onto
-  the window) and see incoming photos inline in the message view. Images land
-  in `<data_dir>/cache/media/` and are rendered from that cache; anything
-  larger than 24 MB or undecodable (webp/gif/…) shows as a plain caption
-  instead of pretending to work.
+- **Images in chat** — send photos (attach button, drop a file anywhere on
+  the window, or paste a screenshot straight into chat with Ctrl/Cmd+V) and
+  see incoming photos inline in the message view. Click an inline image for a
+  full-screen viewer (scroll to zoom, drag to pan, double-click for 100%,
+  Esc to close). Images land in `<data_dir>/cache/media/` (or `cache/paste/`)
+  and are rendered from that cache; anything larger than 24 MB or
+  undecodable (webp/gif/…) shows as a plain caption instead of pretending.
+- **Keyboard flow** — Esc closes, in order: the image viewer, the file
+  picker, Settings, the add-account window, and finally the open chat (back
+  to "pick a chat").
 - **Readable chat view** — day-separator chips (Today/Yesterday/date),
   distinct outgoing/incoming bubble tints with sensible contrast, larger
   message text, and quick timestamps.

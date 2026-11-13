@@ -105,6 +105,16 @@ fn media_cache_key(account: &str, peer_id: PeerId, msg_id: i32) -> String {
 /// Don't auto-download anything larger than this.
 const MAX_MEDIA_BYTES: u64 = 24 * 1024 * 1024;
 
+/// Full-screen image viewer state (ZapFast-style click-to-zoom).
+struct ViewerState {
+    /// Key into `textures`.
+    key: String,
+    /// Multiplier on top of the fit-to-screen scale (1.0 = fit).
+    zoom: f32,
+    /// Pan offset from the screen center, in points.
+    pan: egui::Vec2,
+}
+
 #[derive(Clone)]
 struct MeInfo {
     full_name: String,
@@ -940,6 +950,8 @@ struct TelegramApp {
     failed_media: std::collections::HashSet<String>,
     /// An image staged but not yet sent (composer attachment).
     pending_attachment: Option<PathBuf>,
+    /// Full-screen image viewer, if open.
+    viewer: Option<ViewerState>,
     show_picker: bool,
     picker_dir: PathBuf,
     picker_entries: Vec<(String, PathBuf, bool, u64)>,
@@ -1003,6 +1015,7 @@ impl TelegramApp {
             textures: HashMap::new(),
             failed_media: std::collections::HashSet::new(),
             pending_attachment: None,
+            viewer: None,
             show_picker: false,
             picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             picker_entries: Vec::new(),
@@ -1334,6 +1347,46 @@ impl eframe::App for TelegramApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // ESC closes the top-most thing: viewer → picker → settings/add → chat.
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc {
+            if self.viewer.take().is_some() {
+                // viewer closed
+            } else if self.show_picker {
+                self.show_picker = false;
+            } else if self.show_settings {
+                self.show_settings = false;
+            } else if self.show_add {
+                self.show_add = false;
+            } else if let Some(account) = self.sel_account.clone() {
+                // "close the chat" — return to the "pick a chat" screen.
+                self.sel_peer.remove(&account);
+                self.pending_attachment = None;
+            }
+        }
+
+        // Stage an image pasted into the app (Ctrl/Cmd+V with no usable text
+        // on the clipboard — egui-winit emits Event::PasteImage then).
+        let pasted: Vec<egui::ColorImage> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::PasteImage(image) => Some((**image).clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        for image in pasted {
+            match self.stage_pasted_image(&image) {
+                Ok(()) => {
+                    self.toast = Some(("image pasted — press Enter to send".into(), Instant::now()))
+                }
+                Err(e) => self.toast = Some((format!("paste failed: {e}"), Instant::now())),
+            }
+        }
+
         // Stage an image dropped from the OS onto the window.
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
@@ -1370,6 +1423,7 @@ impl eframe::App for TelegramApp {
         self.ui_settings_window(ui.ctx());
         self.ui_add_window(ui.ctx());
         self.ui_picker_window(ui.ctx());
+        self.ui_viewer(ui.ctx());
         self.ui_toast(ui.ctx());
     }
 }
@@ -1763,6 +1817,7 @@ impl TelegramApp {
         } else {
             egui::Stroke::new(1.0, egui::Color32::from_gray(72))
         };
+        let mut open_viewer: Option<ViewerState> = None;
         egui::Frame::default()
             .fill(fill)
             .stroke(stroke)
@@ -1776,11 +1831,20 @@ impl TelegramApp {
                             let key = media_cache_key(account, peer_id, message.id);
                             if let Some(tex) = self.textures.get(&key) {
                                 let size = tex.size_vec2();
-                                let scale = (300.0 / size.x).min(220.0 / size.y).min(1.0);
-                                ui.add(
+                                let scale = (340.0 / size.x).min(260.0 / size.y).min(1.0);
+                                let response = ui.add(
                                     egui::Image::new(egui::load::SizedTexture::new(tex.id(), size * scale))
-                                        .corner_radius(8.0),
+                                        .corner_radius(8.0)
+                                        .sense(egui::Sense::click()),
                                 );
+                                let response = response.on_hover_text("click to open full-size viewer");
+                                if response.clicked() {
+                                    open_viewer = Some(ViewerState {
+                                        key: key.clone(),
+                                        zoom: 1.0,
+                                        pan: egui::Vec2::ZERO,
+                                    });
+                                }
                             } else if self.failed_media.contains(&key) {
                                 ui.label(
                                     egui::RichText::new("[image unavailable]")
@@ -1816,6 +1880,140 @@ impl TelegramApp {
                     );
                 });
             });
+        if let Some(viewer) = open_viewer {
+            self.viewer = Some(viewer);
+        }
+    }
+
+    /// Write a pasted clipboard image to `<data_dir>/cache/paste/` and stage it.
+    fn stage_pasted_image(&mut self, image: &egui::ColorImage) -> Result<(), String> {
+        let chat_open = self
+            .sel_account
+            .as_ref()
+            .map(|a| self.sel_peer.get(a).is_some())
+            .unwrap_or(false);
+        if !chat_open {
+            return Err("open a chat first".to_string());
+        }
+        let dir = self.data_dir.join("cache").join("paste");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let bytes: Vec<u8> = image
+            .pixels
+            .iter()
+            .flat_map(|c| c.to_srgba_unmultiplied())
+            .collect();
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("pasted_{millis}.png"));
+        image::save_buffer(
+            &path,
+            &bytes,
+            image.width() as u32,
+            image.height() as u32,
+            image::ColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())?;
+        self.pending_attachment = Some(path);
+        Ok(())
+    }
+
+    /// ZapFast-style full-screen image viewer: Esc/× closes, scroll zooms,
+    /// drag pans, double-click toggles fit ↔ 100%.
+    fn ui_viewer(&mut self, ctx: &egui::Context) {
+        let Some(mut viewer) = self.viewer.take() else { return };
+        // Texture gone (never decoded or cache cleared) → drop the viewer.
+        let Some(tex) = self.textures.get(&viewer.key) else { return };
+        let tex_size = tex.size_vec2();
+        let tex_id = tex.id();
+
+        let screen = ctx.input(|i| i.screen_rect());
+        let fit = (screen.width() * 0.90 / tex_size.x.max(1.0))
+            .min(screen.height() * 0.86 / tex_size.y.max(1.0))
+            .min(1.0);
+
+        let mut close = false;
+        let mut toggle = false;
+
+        egui::Area::new(egui::Id::new("image_viewer"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.left_top())
+            .show(ctx, |ui| {
+                let response = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(225));
+
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll.abs() > 0.0 && response.hovered() {
+                    viewer.zoom = (viewer.zoom * (1.0 + scroll * 0.0016)).clamp(0.35, 12.0);
+                }
+                if response.dragged() {
+                    viewer.pan += ui.input(|i| i.pointer.delta());
+                }
+                if response.double_clicked() {
+                    toggle = true;
+                }
+
+                let scale = fit * viewer.zoom;
+                let size = tex_size * scale;
+                let center = screen.center() + viewer.pan;
+                let rect = egui::Rect::from_center_size(center, size);
+                ui.painter().image(
+                    tex_id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+
+            });
+
+        // Hint bar pinned to the bottom-center of the screen.
+        egui::Area::new(egui::Id::new("image_viewer_hint"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Esc close · scroll zoom · drag pan · double-click 1:1 / fit")
+                        .small()
+                        .color(egui::Color32::from_gray(190)),
+                );
+            });
+
+        // HUD buttons pinned to the top-right of the screen.
+        egui::Area::new(egui::Id::new("image_viewer_hud"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("−").clicked() {
+                        viewer.zoom = (viewer.zoom / 1.25).clamp(0.35, 12.0);
+                    }
+                    if ui.button("+").clicked() {
+                        viewer.zoom = (viewer.zoom * 1.25).clamp(0.35, 12.0);
+                    }
+                    if ui.button("1:1").on_hover_text("actual pixels").clicked() {
+                        viewer.zoom = 1.0 / fit;
+                        viewer.pan = egui::Vec2::ZERO;
+                    }
+                    if ui.button("Fit").clicked() {
+                        viewer.zoom = 1.0;
+                        viewer.pan = egui::Vec2::ZERO;
+                    }
+                    if ui.button("×").on_hover_text("close (Esc)").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if toggle {
+            viewer.zoom = if (viewer.zoom - 1.0).abs() < 0.01 { 1.0 / fit } else { 1.0 };
+            if viewer.zoom <= 1.0 {
+                viewer.pan = egui::Vec2::ZERO;
+            }
+        }
+        if !close {
+            self.viewer = Some(viewer);
+        }
     }
 
     /// Open the in-app image picker for the composer.
