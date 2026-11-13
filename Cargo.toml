@@ -1,0 +1,51 @@
+[package]
+name = "mlxysftele"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "ZapFast-style ultra low-memory multi-account Telegram client (MTProto) with local premium conveniences"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MlxySF/mlxysftele"
+homepage = "https://github.com/MlxySF/mlxysftele"
+readme = "README.md"
+keywords = ["telegram", "mtproto", "client", "low-memory", "multi-account"]
+categories = ["network-programming", "command-line-utilities"]
+
+# Dependency budget is deliberately tiny (ZapFast-style: no GUI stack, no
+# async soup beyond tokio, no proc-macro heavy frameworks). Every crate here
+# is either required to speak MTProto or is small and auditable.
+[dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt",        # current_thread runtime only (see [profile.release])
+    "macros",
+    "sync",      # mpsc/unbounded channels
+    "time",      # interval/sleep for idle reaper & debounce
+    "fs",        # grammers `fs` feature needs tokio::fs
+    "io-util",   # AsyncRead/AsyncWrite adapters
+    "signal",    # graceful Ctrl-C in `tail` / `daemon`
+] }
+grammers-client = { version = "0.8", default-features = false, features = ["fs"] }
+grammers-mtsender = "0.8"
+# Direct dependency on grammers-session so we can open SqliteSession files and
+# name the UpdatesLike type. Default features pull in `sqlite-storage`.
+grammers-session = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rpassword = "7"
+
+# Optional: swap the system allocator for mimalloc. Usually lower/flatter RSS
+# behaviour for chat-heavy workloads. Enable with: --features mimalloc
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
+
+# ZapFast-class footprint: trade a little performance for size & memory.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
