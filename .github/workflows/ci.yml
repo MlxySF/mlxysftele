@@ -21,7 +21,24 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo test
-        run: cargo test --all-targets
+        id: test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --all-targets 2>&1 | tee /tmp/cargo-test.log
+
+      - name: Annotate cargo test failures
+        if: steps.test.conclusion == 'failure'
+        run: python3 ci/annotate.py /tmp/cargo-test.log
 
       - name: cargo build --release
-        run: cargo build --release
+        id: release
+        if: success()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee /tmp/cargo-release.log
+
+      - name: Annotate cargo build failures
+        if: steps.release.conclusion == 'failure'
+        run: python3 ci/annotate.py /tmp/cargo-release.log
