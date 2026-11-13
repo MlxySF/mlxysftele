@@ -58,10 +58,10 @@ jobs:
         shell: bash
         run: |
           if [ ! -f Cargo.lock ]; then echo "no Cargo.lock"; exit 0; fi
-          DATA=$(base64 -w0 Cargo.lock)
-          CHUNK=8000
+          DATA=$(gzip -9 -c Cargo.lock | base64 -w0)
+          CHUNK=3500
           TOTAL=$(( (${#DATA} + CHUNK - 1) / CHUNK ))
-          echo "exporting Cargo.lock (${#DATA} b64 chars) in $TOTAL chunk(s)"
+          echo "exporting gzipped Cargo.lock (${#DATA} b64 chars) in $TOTAL chunk(s)"
           i=0
           while [ "$i" -lt "$TOTAL" ]; do
             START=$((i * CHUNK))
