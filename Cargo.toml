@@ -24,11 +24,15 @@ tokio = { version = "1", default-features = false, features = [
     "io-util",   # AsyncRead/AsyncWrite adapters
     "signal",    # graceful Ctrl-C in `tail` / `daemon`
 ] }
-grammers-client = { version = "0.8", default-features = false, features = ["fs"] }
-grammers-mtsender = "0.8"
+# NOTE: the crates.io release (v0.8.0) predates the module reorganization
+# into client/ peer/ message/ update/ that this crate is written against.
+# grammers itself recommends depending from git. Pin ALL grammers crates
+# to one exact commit so the API is stable and matches this crate.
+grammers-client = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e", default-features = false, features = ["fs"] }
+grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
 # Direct dependency on grammers-session so we can open SqliteSession files and
 # name the UpdatesLike type. Default features pull in `sqlite-storage`.
-grammers-session = "0.8"
+grammers-session = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rpassword = "7"
