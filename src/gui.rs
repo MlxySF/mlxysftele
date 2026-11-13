@@ -1336,7 +1336,7 @@ impl eframe::App for TelegramApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Stage an image dropped from the OS onto the window.
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
         });
         if let Some(path) = dropped.into_iter().find(|p| is_image_file(p)) {
             let chat_open = self
