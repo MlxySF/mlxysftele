@@ -12,15 +12,16 @@ stays honest about what the server enforces.
 - `download --resume` (partial + Range requests via `upload.getFile` offsets)
 - `send --file` via `client.upload_file` + `send_message(...).document(...)`
 
-## v0.3 — GUI shell (ZapFast parity)
+## v0.3 — GUI polish (ZapFast parity)
 
-- `feature = "gui"`: egui + egui_extras only (no web view, no Electron)
-- Three panes: accounts (registry) · dialogs · messages
+- `gui` is now the default mode: accounts · chats · messages, all accounts
+  connected simultaneously, live update streams, unread badges,
+  search filter, server-premium `PRO` badge, honest local-premium toggles
 - Local themes from `premium themes` flag; short animation timings from
   `fast_animations`
 - Target: < 200 MB RSS idle with 1 connected account, like ZapFast
-  (< 100 MB for the headless daemon path)
 - Media viewer streamed to disk, thumbnails via `litemap`/`image` (opt-in)
+- Per-account proxy + per-account device model controls
 
 ## v0.4 — account ergonomics
 
@@ -38,9 +39,9 @@ stays honest about what the server enforces.
 
 ## Memory discipline checklist (kept honest per release)
 
-- [ ] current_thread runtime stays the default
-- [ ] no unbounded caches; idle eviction stays under `--idle-ttl`
+- [x] GUI: accounts stay connected simultaneously (supersedes daemon hot-set
+      as the flagship mode; the daemon remains for headless/VPS use)
+- [ ] no unbounded caches — dialog list ≤ 150/account, chat cache ≤ 100 messages
 - [ ] media paths streamed, never buffered whole
-- [ ] release binary size budget: < 8 MB (opt-level = "z", LTO fat, strip)
-- [ ] RSS budget: < 32 MB daemon idle with 0 hot connections;
-      < 48 MB with 1 hot connection (measured with `mlxysftele stats`)
+- [ ] release binary size budget: < 8 MB headless CLI target; GUI will be larger
+- [ ] RSS budget: measure GUI with `mlxysftele stats` (target ≤ 200 MB idle, 1 account)

@@ -1,19 +1,20 @@
 [package]
 name = "mlxysftele"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
-description = "ZapFast-style ultra low-memory multi-account Telegram client (MTProto) with local premium conveniences"
+# egui 0.37 (GUI) requires a newer toolchain; this is our effective MSRV.
+rust-version = "1.95"
+description = "ZapFast-style ultra low-memory multi-account Telegram client (MTProto) with local premium conveniences and a native egui GUI"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MlxySF/mlxysftele"
 homepage = "https://github.com/MlxySF/mlxysftele"
 readme = "README.md"
 keywords = ["telegram", "mtproto", "client", "low-memory", "multi-account"]
-categories = ["network-programming", "command-line-utilities"]
+categories = ["network-programming", "gui", "command-line-utilities"]
 
-# Dependency budget is deliberately tiny (ZapFast-style: no GUI stack, no
-# async soup beyond tokio, no proc-macro heavy frameworks). Every crate here
-# is either required to speak MTProto or is small and auditable.
+# Dependency budget is ZapFast-disciplined: required to speak MTProto
+# (grammers + tokio), the native GUI stack (eframe/egui — no web view),
+# and small auditable extras. No proc-macro heavy frameworks.
 [dependencies]
 tokio = { version = "1", default-features = false, features = [
     "rt",        # current_thread runtime only (see [profile.release])
@@ -33,6 +34,9 @@ grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "fa7692e
 # Direct dependency on grammers-session so we can open SqliteSession files and
 # name the UpdatesLike type. Default features pull in `sqlite-storage`.
 grammers-session = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
+# The whole point: a native, ZapFast-style GUI with no web view.
+eframe = { version = "0.37", default-features = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rpassword = "7"

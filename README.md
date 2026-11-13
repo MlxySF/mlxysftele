@@ -3,12 +3,12 @@
 [![ci](https://github.com/MlxySF/mlxysftele/actions/workflows/ci.yml/badge.svg?branch=arena/275d9362-mlxysftele)](https://github.com/MlxySF/mlxysftele/actions/workflows/ci.yml)
 
 **A ZapFast-style, ultra low-RAM Telegram client in Rust.** Unlimited account
-login, per-account sessions, a headless multi-account daemon, and honest
-local client-side "premium" conveniences — all in one small static binary
-with a current-thread async runtime.
+login, per-account sessions, and honest local client-side "premium"
+conveniences — all in one native binary with a native egui GUI.
 
-> **Status:** v0.1.0 · headless core (CLI + daemon). GUI shell tracked in
-> [`docs/ROADMAP.md`](docs/ROADMAP.md). Not affiliated with Telegram.
+> **Status:** v0.2.0 · **native GUI** (egui — no browser, no Electron, no
+> webview) with all accounts connected simultaneously, plus the CLI/daemon for
+> headless use. Not affiliated with Telegram.
 
 ---
 
@@ -27,24 +27,28 @@ native binding):
 
 | | mlxysftele | Electron wrapper | Telegram Desktop |
 |---|---|---|---|
-| Engine | tokio current_thread | Node + Chromium | Qt |
-| Dormant accounts | **~0 RAM** (sqlite on disk) | n/a | per-instance |
+| Engine | Rust + egui (native) | Node + Chromium | Qt |
+| GUI toolkit | egui (immediate mode, no web view) | Chromium | Qt Widgets |
 | Downloads | streamed to disk | buffered | buffered |
 | Binary | `strip`ed, `opt-level=z`, LTO | 100+ MB FS | large |
-| Accounts | unlimited (software) | 1+ | multiple |
+| Accounts | unlimited, **all stay connected** | 1+ | multiple |
 
 [zapfast-bench]: https://zapfast.rocks/benchmarks/
 [sysfix]: https://yoursystemfixer.com/whatsapp-high-ram-usage-windows-11-alternatives/
 
 ## Features
 
-- **Unlimited accounts** — register as many as you like. Each dormant account
-  is a JSON registry entry (~200 bytes) plus one sqlite session file on disk.
-  Connections are lazy, and the daemon evicts idle ones (see
-  [Memory model](#memory-model)).
+- **Unlimited accounts — all stay connected.** Register as many as you like
+  from the GUI (`+ Add account`); every registered account holds its MTProto
+  connection for the whole lifetime of the app, so messages stream in live
+  for all of them at once. No lazy connect, no eviction.
 - **Real MTProto** — login with your phone via Telegram's official code flow
   (supports 2FA / SRP passwords). Uses your own `api_id`/`api_hash` from
   <https://my.telegram.org/apps>.
+- **Native GUI** — three panes (accounts · chats · messages), live update
+  streams per account, unread badges, search filter, per-account status dots,
+  `PRO` badge for genuine server premium. Runs on its own background tokio
+  runtime; the UI never blocks on the network.
 - **Send / tail / dialogs / whoami / streamed downloads** from the CLI.
 - **`daemon`** — a headless multi-account hub: bounded hot set (`--max-hot`),
   idle eviction (`--idle-ttl`), one-line message stream per account, stdin
@@ -59,26 +63,32 @@ native binding):
 
 ## Quick start
 
-Prerequisites: Rust **1.85+** and network access to `github.com` (git-pinned
-grammers), `crates.io`, and Telegram's datacenters.
+Prerequisites: Rust **1.95+** and network access to `github.com` (git-pinned
+grammers), `crates.io`, and Telegram's datacenters. On Linux you need the
+usual GUI build libraries, e.g. `sudo apt install libwayland-dev libxkbcommon-dev`.
 
 ```sh
 git clone https://github.com/MlxySF/mlxysftele.git
 cd mlxysftele
 cargo build --release          # binary: target/release/mlxysftele
 
-# 1) One-time: your own Telegram API credentials (https://my.telegram.org/apps)
-./target/release/mlxysftele init --api-id=123456 --api-hash=your_api_hash_here
+# 1) Launch the GUI
+./target/release/mlxysftele
 
-# 2) Log in any number of accounts; each asks for your phone + the code Telegram sends
+# 2) One-time: Telegram API credentials — create them at
+#    https://my.telegram.org/apps, then open Settings (gear) and save them.
+#    (Or seed them once from the CLI: `init --api-id=123456 --api-hash=…`)
+
+# 3) `+ Add account` — handle + phone → code → optional 2FA. Repeat for every
+#    account you own; each comes online immediately and stays online.
+```
+
+Prefer a terminal? The old CLI is still there (see the table below):
+
+```sh
 ./target/release/mlxysftele login work    --phone=+6581234567
-./target/release/mlxysftele login personal --phone=+6598765432
-
-# 3) Use them
-./target/release/mlxysftele whoami work
 ./target/release/mlxysftele dialogs work --limit=10
 ./target/release/mlxysftele send work me "hello from mlxysftele"
-./target/release/mlxysftele tail work        # live stream, Ctrl-C to stop
 ./target/release/mlxysftele stats             # process memory footprint
 ```
 
@@ -93,6 +103,7 @@ Headless hub (prints incoming messages from all hot accounts, stdin commands):
 
 | Command | What it does |
 |---|---|
+| `gui` (or no arguments) | Launch the native GUI — all accounts stay connected |
 | `init --api-id=N --api-hash=H` | Store API credentials (or set `MLXYSFTELE_API_ID` / `MLXYSFTELE_API_HASH`) |
 | `login <name> [--phone=+..]` | Register/refresh an account (interactive code + 2FA) |
 | `accounts [--check]` | List registered accounts; `--check` verifies authorization online |

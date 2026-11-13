@@ -17,6 +17,13 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install system libraries for the GUI build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev
+
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
 

@@ -1,7 +1,8 @@
 //! mlxysftele — a ZapFast-style, ultra low-memory, multi-account Telegram
 //! client with local (client-side) premium conveniences.
 //!
-//! Single-binary, current-thread async runtime, no GUI stack, no frameworks.
+//! Default mode is a native egui GUI (`mlxysftele` with no arguments). The
+//! CLI commands below remain for scripting, servers and headless VPS use.
 //! See README.md and docs/LOCAL_PREMIUM.md.
 
 #[cfg(feature = "mimalloc")]
@@ -10,6 +11,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod config;
 mod daemon;
+mod gui;
 mod log;
 mod lowmem;
 mod premium;
@@ -24,9 +26,12 @@ const USAGE: &str = "\
 mlxysftele — ZapFast-style low-RAM multi-account Telegram client
 
 USAGE:
+  mlxysftele                  Launch the native GUI (default)
+  mlxysftele gui              Launch the native GUI
   mlxysftele <command> [options]
 
 COMMANDS:
+  gui                    Launch the native egui GUI (all accounts stay connected)
   init                   Store Telegram API credentials (https://my.telegram.org/apps)
                            --api-id=123456 --api-hash=hex
   login <name>           Register / sign in an account (interactive)
@@ -107,6 +112,18 @@ impl Cli {
 }
 
 fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Bare `mlxysftele` (or `mlxysftele gui`) launches the native GUI and
+    // owns the process; it manages its own background tokio runtime.
+    if argv.is_empty() || matches!(argv[0].as_str(), "gui" | "--gui") {
+        return match gui::run(util::data_dir()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -117,11 +134,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    runtime.block_on(dispatch())
+    runtime.block_on(dispatch(argv))
 }
 
-async fn dispatch() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+async fn dispatch(argv: Vec<String>) -> ExitCode {
     let Some(cmd) = argv.first().cloned() else {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
