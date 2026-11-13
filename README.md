@@ -1,5 +1,7 @@
 # mlxysftele
 
+[![ci](https://github.com/MlxySF/mlxysftele/actions/workflows/ci.yml/badge.svg?branch=arena/275d9362-mlxysftele)](https://github.com/MlxySF/mlxysftele/actions/workflows/ci.yml)
+
 **A ZapFast-style, ultra low-RAM Telegram client in Rust.** Unlimited account
 login, per-account sessions, a headless multi-account daemon, and honest
 local client-side "premium" conveniences — all in one small static binary
