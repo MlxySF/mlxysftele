@@ -479,10 +479,10 @@ impl Worker {
         };
         match client.check_password(token, password.as_bytes()).await {
             Ok(user) => self.finish_login(name, phone, client, pool, user).await,
-            Err(SignInError::InvalidPassword(_)) => {
+            Err(SignInError::InvalidPassword(password_token)) => {
                 self.pending_logins.insert(
                     name.clone(),
-                    PendingLogin::AwaitingPassword { client, pool, phone, token },
+                    PendingLogin::AwaitingPassword { client, pool, phone, token: password_token },
                 );
                 self.emit(Evt::Login { name, state: LoginEvt::Failed("wrong 2FA password".into()) });
             }
@@ -1152,8 +1152,10 @@ impl TelegramApp {
                     ),
                     None => name.clone(),
                 };
+                // on_hover_text consumes the response; read the click state first.
+                let clicked = response.clicked();
                 response.on_hover_text(format!("{hover}\n{}", status_tooltip(&status)));
-                if response.clicked() {
+                if clicked {
                     clicked_name = Some(name);
                 }
             }
