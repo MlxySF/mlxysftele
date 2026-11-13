@@ -52,19 +52,3 @@ jobs:
           ./target/release/mlxysftele stats > /tmp/smoke-stats.log
           ./target/release/mlxysftele premium info > /tmp/smoke-premium.log
           cat /tmp/smoke-stats.log
-
-      - name: Export Cargo.lock as annotation chunks
-        if: success()
-        shell: bash
-        run: |
-          if [ ! -f Cargo.lock ]; then echo "no Cargo.lock"; exit 0; fi
-          DATA=$(gzip -9 -c Cargo.lock | base64 -w0)
-          CHUNK=3500
-          TOTAL=$(( (${#DATA} + CHUNK - 1) / CHUNK ))
-          echo "exporting gzipped Cargo.lock (${#DATA} b64 chars) in $TOTAL chunk(s)"
-          i=0
-          while [ "$i" -lt "$TOTAL" ]; do
-            START=$((i * CHUNK))
-            echo "::notice::CARGO_LOCK_CHUNK $i/$TOTAL ${DATA:$START:$CHUNK}"
-            i=$((i + 1))
-          done
