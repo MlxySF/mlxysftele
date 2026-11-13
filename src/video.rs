@@ -16,6 +16,8 @@
 //! `#[link(name = "mpv")]` requires libmpv to be present at link time
 //! (Debian/Ubuntu: `apt install libmpv-dev`).
 
+use eframe::egui;
+
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -84,7 +86,7 @@ pub struct VideoPlayer {
     /// Set by the mpv update callback; consumed by `refresh_frame`.
     frame_ready: Arc<AtomicBool>,
     /// Reusable SW target surface (`stride == width * 4`).
-    buf: Vec<u8>,
+    buf: Vec<u32>,
     buf_size: (usize, usize),
     /// Display aspect (w/h), learned once mpv reports video params.
     aspect: Option<f32>,
@@ -115,7 +117,7 @@ impl VideoPlayer {
             ("hwdec", "no"),           // SW renderer can't use hw surfaces
             ("keep-open", "yes"),      // stay on last frame at EOF
             ("config", "no"),          // never read user mpv.conf
-            ("log-level", "warn"),     // quiet
+            ("msg-level", "all=warn"), // quiet
         ];
         for (name, value) in pre_init_opts {
             let c_name = CString::new(name).unwrap();
@@ -197,13 +199,16 @@ impl VideoPlayer {
 
         let aspect = self.aspect.unwrap_or(16.0 / 9.0);
         let video_w = self.video_width().unwrap_or(MAX_RENDER_WIDTH);
-        let target_w = video_w.clamp(160, MAX_RENDER_WIDTH) as usize;
-        let target_h = ((target_w as f32 / aspect).round().max(90.0)) as usize;
+        let desired_w = video_w.clamp(1, MAX_RENDER_WIDTH) as f32;
+        let desired_h = desired_w / aspect;
+        let scale = (MAX_RENDER_WIDTH as f32 / desired_h).min(1.0);
+        let target_w = (desired_w * scale).round().max(1.0) as usize;
+        let target_h = (desired_h * scale).round().clamp(1.0, MAX_RENDER_WIDTH as f32) as usize;
 
         let stride = target_w * 4;
-        let needed = stride * target_h;
+        let needed = target_w * target_h;
         if self.buf.len() != needed || self.buf_size != (target_w, target_h) {
-            self.buf = vec![0u8; needed];
+            self.buf = vec![0u32; needed];
             self.buf_size = (target_w, target_h);
         }
 
@@ -226,11 +231,13 @@ impl VideoPlayer {
             return;
         }
         // "rgb0" leaves the 4th byte undefined — force opaque alpha for egui.
-        for px in self.buf.chunks_exact_mut(4) {
+        // u32 storage guarantees the 4-byte alignment required by libmpv.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<u8>(), needed * 4) };
+        for px in bytes.chunks_exact_mut(4) {
             px[3] = 255;
         }
 
-        let image = egui::ColorImage::from_rgba_unmultiplied([target_w, target_h], &self.buf);
+        let image = egui::ColorImage::from_rgba_unmultiplied([target_w, target_h], bytes);
         match &mut self.texture {
             Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
             None => {
@@ -380,5 +387,18 @@ impl Drop for VideoPlayer {
                 self.mpv = std::ptr::null_mut();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initializes_software_renderer() {
+        // Opening a missing file is asynchronous; this exercises initialization
+        // and verifies our mpv options and SW renderer without a display.
+        let player = VideoPlayer::open(Path::new("/nonexistent-mlxysftele-video.mp4"), "test");
+        assert!(player.is_ok(), "libmpv initialization failed: {}", player.err().unwrap_or_default());
     }
 }

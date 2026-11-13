@@ -174,6 +174,7 @@ enum Evt {
         /// Photo vs video — decides whether the GUI decodes a texture or opens the player.
         kind: MsgMedia,
     },
+    VideoError { cache_key: String, message: String },
     Login { name: String, state: LoginEvt },
     Toast(String),
 }
@@ -340,7 +341,24 @@ fn spawn_media_download(
     let evt_tx = evt_tx.clone();
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let ok = client.download_media(&media, &path).await.is_ok();
+        // Write to a temporary file, never treating a partial download as cached.
+        // Enforce the cap on actual bytes even if the size hint is absent or wrong.
+        use std::io::Write;
+        let temp_path = path.with_extension(format!("{}.part", path.extension().unwrap_or_default().to_string_lossy()));
+        let ok = async {
+            let mut file = std::fs::File::create(&temp_path).map_err(|_| ())?;
+            let mut download = client.iter_download(&media);
+            let mut total = 0u64;
+            while let Some(chunk) = download.next().await.map_err(|_| ())? {
+                total = total.checked_add(chunk.len() as u64).ok_or(())?;
+                if total > cap_bytes { return Err(()); }
+                file.write_all(&chunk).map_err(|_| ())?;
+            }
+            drop(file);
+            std::fs::rename(&temp_path, &path).map_err(|_| ())?;
+            Ok::<(), ()>(())
+        }.await.is_ok();
+        if !ok { let _ = std::fs::remove_file(&temp_path); }
         let _ = evt_tx.send(Evt::MediaReady {
             account: account_s,
             peer_id,
@@ -723,11 +741,11 @@ impl Worker {
 
     /// Kick off (or fast-path) an embedded playback for a video message.
     async fn open_video(&mut self, account: &str, peer_id: PeerId, msg_id: i32) {
+        let cache_key = media_cache_key(account, peer_id, msg_id);
         let Some(client) = self.conns.get(account).map(|c| c.client.clone()) else {
-            self.emit(Evt::Toast("account is not connected".into()));
+            self.emit(Evt::VideoError { cache_key, message: "account is not connected".into() });
             return;
         };
-        let cache_key = media_cache_key(account, peer_id, msg_id);
         let dir = self.data_dir.join("cache").join("media");
         // Fast path: already downloaded under any known extension.
         for ext in ["mp4", "webm", "mkv", "mov", "avi", "mpg", "3gp", "ogv", "mpeg", "bin"] {
@@ -745,9 +763,9 @@ impl Worker {
             }
         }
         let Some(media) = self.media_objects.get(&cache_key).cloned() else {
-            self.emit(Evt::Toast(
+            self.emit(Evt::VideoError { cache_key, message:
                 "video unavailable — reopen the chat (media list was refreshed)".into(),
-            ));
+            });
             return;
         };
         let size_hint = match &media {
@@ -756,11 +774,11 @@ impl Worker {
         };
         if let Some(size) = size_hint {
             if size > MAX_VIDEO_BYTES {
-                self.emit(Evt::Toast(format!(
+                self.emit(Evt::VideoError { cache_key, message: format!(
                     "video is {} — too large to download here (cap {})",
                     util::human_bytes(size),
                     util::human_bytes(MAX_VIDEO_BYTES),
-                )));
+                ) });
                 return;
             }
             self.emit(Evt::Toast(format!("downloading video ({})…", util::human_bytes(size))));
@@ -1348,6 +1366,12 @@ impl TelegramApp {
                         }
                         self.decode_into_textures(&cache_key, &path);
                     }
+                }
+            }
+            Evt::VideoError { cache_key, message } => {
+                if self.pending_video_open.as_deref() == Some(cache_key.as_str()) {
+                    self.pending_video_open = None;
+                    self.toast = Some((message, Instant::now()));
                 }
             }
             Evt::Login { name, state } => match state {
@@ -2378,7 +2402,7 @@ impl TelegramApp {
                     let resp = ui.add(
                         egui::Slider::new(&mut slider, 0.0..=dur).show_value(false)
                     );
-                    if resp.drag_stopped() {
+                    if resp.changed() {
                         player.seek_to(slider);
                     }
                     ui.label(egui::RichText::new(format_mmss(dur)).small().monospace());
