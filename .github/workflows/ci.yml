@@ -28,7 +28,7 @@ jobs:
           cargo test --all-targets 2>&1 | tee /tmp/cargo-test.log
 
       - name: Annotate cargo test failures
-        if: steps.test.conclusion == 'failure'
+        if: failure()
         run: python3 ci/annotate.py /tmp/cargo-test.log
 
       - name: cargo build --release
@@ -40,5 +40,5 @@ jobs:
           cargo build --release 2>&1 | tee /tmp/cargo-release.log
 
       - name: Annotate cargo build failures
-        if: steps.release.conclusion == 'failure'
+        if: failure()
         run: python3 ci/annotate.py /tmp/cargo-release.log

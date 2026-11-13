@@ -33,8 +33,12 @@ def main() -> int:
         print("usage: annotate.py <log>", file=sys.stderr)
         return 2
 
-    with open(sys.argv[1], "r", errors="replace") as fh:
-        lines = fh.read().splitlines()
+    try:
+        with open(sys.argv[1], "r", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        print(f"::error::annotate.py could not read {sys.argv[1]}: {exc}")
+        return 0
 
     annotations = []
     pending_message = None
