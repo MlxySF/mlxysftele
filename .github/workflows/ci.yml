@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -42,3 +42,29 @@ jobs:
       - name: Annotate cargo build failures
         if: failure()
         run: python3 ci/annotate.py /tmp/cargo-release.log
+
+      - name: Smoke test the release binary
+        if: success()
+        shell: bash
+        run: |
+          set -o pipefail
+          ./target/release/mlxysftele help > /tmp/smoke-help.log
+          ./target/release/mlxysftele stats > /tmp/smoke-stats.log
+          ./target/release/mlxysftele premium info > /tmp/smoke-premium.log
+          cat /tmp/smoke-stats.log
+
+      - name: Commit Cargo.lock if missing
+        if: success()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f Cargo.lock ] && ! git ls-files --error-unmatch Cargo.lock > /dev/null 2>&1; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "chore: add Cargo.lock [skip ci]"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ github.ref_name }}"
+          else
+            echo "Cargo.lock already committed or not generated; nothing to do"
+          fi
