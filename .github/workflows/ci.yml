@@ -50,12 +50,6 @@ jobs:
         if: failure()
         run: python3 ci/annotate.py /tmp/cargo-release.log
 
-      - name: Export Cargo.lock (temporary, for local commit)
-        if: success()
-        shell: bash
-        run: |
-          python3 ci/lock_export.py --skip 9
-
       - name: Smoke test the release binary
         if: success()
         shell: bash
