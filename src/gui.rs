@@ -104,6 +104,23 @@ struct MsgItem {
     media: Option<MsgMedia>,
 }
 
+/// Insert or refresh a message in one account's chat. Telegram can deliver
+/// the same message through both the send response and the live update stream.
+/// IDs are only compared within this chat, not across accounts or peers.
+/// Returns true only when this is a new message in the cache.
+fn upsert_chat_message(chat: &mut Vec<MsgItem>, msg: MsgItem) -> bool {
+    if let Some(existing) = chat.iter_mut().find(|existing| existing.id == msg.id) {
+        *existing = msg;
+        return false;
+    }
+    chat.push(msg);
+    if chat.len() > MAX_CACHED_MESSAGES {
+        let excess = chat.len() - MAX_CACHED_MESSAGES;
+        chat.drain(..excess);
+    }
+    true
+}
+
 /// Cache key used for an image attached to `msg_id` in `account`'s chat `peer_id`.
 fn media_cache_key(account: &str, peer_id: PeerId, msg_id: i32) -> String {
     format!("{account}_{}_{msg_id}", peer_id)
@@ -1284,14 +1301,11 @@ impl TelegramApp {
             Evt::Incoming { account, peer_id, msg } => {
                 let is_open = self.sel_account.as_deref() == Some(account.as_str())
                     && self.sel_peer.get(&account) == Some(&peer_id);
-                if let Some(chat) = self.chats.get_mut(&(account.clone(), peer_id)) {
-                    chat.push(msg);
-                    if chat.len() > MAX_CACHED_MESSAGES {
-                        let excess = chat.len() - MAX_CACHED_MESSAGES;
-                        chat.drain(..excess);
-                    }
-                }
-                if !is_open {
+                let outgoing = msg.outgoing;
+                let is_new = self.chats.get_mut(&(account.clone(), peer_id))
+                    .map(|chat| upsert_chat_message(chat, msg))
+                    .unwrap_or(true);
+                if !is_open && !outgoing && is_new {
                     *self.unread.entry((account.clone(), peer_id)).or_insert(0) += 1;
                 }
                 // Unknown peer? Refresh the dialog list (throttled).
@@ -1324,11 +1338,7 @@ impl TelegramApp {
                         }
                     }
                     if let Some(chat) = self.chats.get_mut(&(account.clone(), peer_id)) {
-                        chat.push(msg);
-                        if chat.len() > MAX_CACHED_MESSAGES {
-                            let excess = chat.len() - MAX_CACHED_MESSAGES;
-                            chat.drain(..excess);
-                        }
+                        upsert_chat_message(chat, msg);
                     }
                     // If the chat was not open the user will re-fetch history on next open.
                 }
@@ -2911,5 +2921,64 @@ impl TelegramApp {
                         });
                 });
         }
+    }
+}
+
+
+#[cfg(test)]
+mod message_cache_tests {
+    use super::*;
+
+    fn photo(id: i32, text: &str) -> MsgItem {
+        MsgItem { id, outgoing: true, unix: 1, text: text.into(), media: Some(MsgMedia::Photo) }
+    }
+
+    #[test]
+    fn send_response_and_update_show_one_photo_in_both_orders() {
+        for (first, second) in [("response", "update"), ("update", "response")] {
+            let mut chat = Vec::new();
+            assert!(upsert_chat_message(&mut chat, photo(42, first)));
+            assert!(!upsert_chat_message(&mut chat, photo(42, second)));
+            assert_eq!(chat.len(), 1);
+            assert_eq!(chat[0].id, 42);
+            assert_eq!(chat[0].text, second);
+            assert!(matches!(&chat[0].media, Some(MsgMedia::Photo)));
+        }
+    }
+
+    #[test]
+    fn sent_and_live_update_events_reconcile_without_unread_or_cross_chat_collisions() {
+        for sent_first in [true, false] {
+            let (cmd_tx, _cmd_rx) = unbounded_channel();
+            let (_evt_tx, evt_rx) = std_mpsc::channel();
+            let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+            let peer = PeerId::user(1);
+            let other_peer = PeerId::user(2);
+            let key = ("account".to_owned(), peer);
+            let other_account_key = ("other".to_owned(), peer);
+            let other_peer_key = ("account".to_owned(), other_peer);
+            app.chats.insert(key.clone(), vec![]);
+            app.chats.insert(other_account_key.clone(), vec![photo(42, "other account")]);
+            app.chats.insert(other_peer_key.clone(), vec![photo(42, "other peer")]);
+            let incoming = Evt::Incoming { account: key.0.clone(), peer_id: peer, msg: photo(42, "update") };
+            let sent = Evt::Sent { account: key.0.clone(), peer_id: peer, result: Ok(photo(42, "sent")), source_path: None };
+            if sent_first { app.apply_event(sent); app.apply_event(incoming); }
+            else { app.apply_event(incoming); app.apply_event(sent); }
+            assert_eq!(app.chats[&key].len(), 1);
+            assert!(app.unread.is_empty());
+            assert_eq!(app.chats[&other_account_key][0].text, "other account");
+            assert_eq!(app.chats[&other_peer_key][0].text, "other peer");
+        }
+    }
+
+    #[test]
+    fn distinct_message_ids_are_not_deduplicated_and_cache_is_bounded() {
+        let mut chat = Vec::new();
+        for id in 0..=MAX_CACHED_MESSAGES as i32 {
+            assert!(upsert_chat_message(&mut chat, photo(id, "same image")));
+        }
+        assert_eq!(chat.len(), MAX_CACHED_MESSAGES);
+        assert_eq!(chat[0].id, 1);
+        assert_eq!(chat.last().unwrap().id, MAX_CACHED_MESSAGES as i32);
     }
 }
