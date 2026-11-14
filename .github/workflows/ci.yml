@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system libraries for the GUI build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            libmpv-dev
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        id: test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --all-targets 2>&1 | tee /tmp/cargo-test.log
+
+      - name: Annotate cargo test failures
+        if: failure()
+        run: python3 ci/annotate.py /tmp/cargo-test.log
+
+      - name: cargo build --release
+        id: release
+        if: success()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee /tmp/cargo-release.log
+
+      - name: Annotate cargo build failures
+        if: failure()
+        run: python3 ci/annotate.py /tmp/cargo-release.log
+
+      - name: Smoke test the release binary
+        if: success()
+        shell: bash
+        run: |
+          set -o pipefail
+          ./target/release/mlxysftele help > /tmp/smoke-help.log
+          ./target/release/mlxysftele stats > /tmp/smoke-stats.log
+          ./target/release/mlxysftele premium info > /tmp/smoke-premium.log
+          cat /tmp/smoke-stats.log
+
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+      - name: Test without libmpv import library
+        run: cargo test --locked --all-targets
+      - name: Build release without libmpv import library
+        run: cargo build --locked --release
+      - name: Smoke test
+        run: .\target\release\mlxysftele.exe help
+      - name: Download Windows libmpv for runtime test
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/tags/20261111
+          $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-20261111.*\.7z$' } | Select-Object -First 1
+          if (-not $asset) { throw "x64 libmpv archive not found" }
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv.7z
+          7z x mpv.7z -ompv-runtime -y
+          if ($LASTEXITCODE -ne 0) { throw "libmpv extraction failed" }
+          $dll = Get-ChildItem mpv-runtime -Recurse -Filter libmpv-2.dll | Select-Object -First 1
+          if (-not $dll) { throw "libmpv-2.dll not found in archive" }
+          $dll.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Test Windows libmpv initialization
+        shell: pwsh
+        env:
+          MLXYSFTELE_TEST_MPV: 1
+        run: cargo test --locked initializes_software_renderer

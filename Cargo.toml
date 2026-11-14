@@ -1,0 +1,63 @@
+[package]
+name = "mlxysftele"
+version = "0.2.0"
+edition = "2021"
+# egui 0.37 (GUI) requires a newer toolchain; this is our effective MSRV.
+rust-version = "1.95"
+description = "ZapFast-style ultra low-memory multi-account Telegram client (MTProto) with local premium conveniences and a native egui GUI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MlxySF/mlxysftele"
+homepage = "https://github.com/MlxySF/mlxysftele"
+readme = "README.md"
+keywords = ["telegram", "mtproto", "client", "low-memory", "multi-account"]
+categories = ["network-programming", "gui", "command-line-utilities"]
+
+# Dependency budget is ZapFast-disciplined: required to speak MTProto
+# (grammers + tokio), the native GUI stack (eframe/egui — no web view),
+# and small auditable extras. No proc-macro heavy frameworks.
+[dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt",        # base runtime
+    "rt-multi-thread", # GUI worker runtime (2 worker threads)
+    "macros",
+    "sync",      # mpsc/unbounded channels
+    "time",      # interval/sleep for idle reaper & debounce
+    "fs",        # grammers `fs` feature needs tokio::fs
+    "io-util",   # AsyncRead/AsyncWrite adapters
+    "signal",    # graceful Ctrl-C in `tail` / `daemon`
+] }
+# NOTE: the crates.io release (v0.8.0) predates the module reorganization
+# into client/ peer/ message/ update/ that this crate is written against.
+# grammers itself recommends depending from git. Pin ALL grammers crates
+# to one exact commit so the API is stable and matches this crate.
+grammers-client = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e", default-features = false, features = ["fs"] }
+grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
+# Direct dependency on grammers-session so we can open SqliteSession files and
+# name the UpdatesLike type. Default features pull in `sqlite-storage`.
+grammers-session = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
+# The whole point: a native, ZapFast-style GUI with no web view.
+eframe = { version = "0.37", default-features = true }
+libloading = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Decode images received in chats for inline display.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rpassword = "7"
+
+# Optional: swap the system allocator for mimalloc. Usually lower/flatter RSS
+# behaviour for chat-heavy workloads. Enable with: --features mimalloc
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
+
+# ZapFast-class footprint: trade a little performance for size & memory.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
