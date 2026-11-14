@@ -2339,6 +2339,7 @@ dependencies = [
  "grammers-mtsender",
  "grammers-session",
  "image",
+ "libloading",
  "mimalloc",
  "rpassword",
  "serde",

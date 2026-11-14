@@ -63,9 +63,10 @@ native binding):
   with audio out through whatever audio system libmpv finds (pulse/pipewire/
   alsa). Controls: click the picture to play/pause, ±10 s skip, seek bar,
   volume slider, replay at end of file, Esc/× to close. Nothing plays
-  automatically — videos download only when you tap the card. Building requires
-  libmpv at link time: `sudo apt install libmpv-dev` (Debian/Ubuntu). Video
-  files land in `<data_dir>/cache/media/` like photos.
+  automatically — videos download only when you tap the card. libmpv is loaded
+  at runtime, so the application builds and runs without it; playback requires
+  installing the shared library as described below. Video files land in
+  `<data_dir>/cache/media/` like photos.
 - **Keyboard flow** — Esc closes, in order: the image viewer, the video
   player, the file picker, Settings, the add-account window, and finally the
   open chat (back to "pick a chat").
@@ -88,8 +89,20 @@ native binding):
 
 Prerequisites: Rust **1.95+** and network access to `github.com` (git-pinned
 grammers), `crates.io`, and Telegram's datacenters. On Linux you need the
-usual GUI build libraries, e.g. `sudo apt install libwayland-dev libxkbcommon-dev libmpv-dev`
-(libmpv is what the embedded video player links against).
+usual GUI build libraries, e.g. `sudo apt install libwayland-dev libxkbcommon-dev`.
+
+For embedded video playback, install the libmpv runtime separately:
+
+- **Windows x64:** download an x86_64 **libmpv** DLL build (for example the
+  `mpv-dev-x86_64` archive from [mpv-winbuild releases](https://github.com/shinchiro/mpv-winbuild-cmake/releases)),
+  extract it, and copy `mpv-2.dll` (or `libmpv-2.dll`) beside `mlxysftele.exe`
+  (for a Cargo release build, `target\release\`). Copy any DLL dependencies
+  shipped with that build too. Use a build matching your Windows architecture;
+  an `mpv.exe` alone is not the library. Restart the app afterward.
+- **Debian/Ubuntu:** install the libmpv runtime package (`libmpv2` on Ubuntu
+  24.04; package name varies by release), or `sudo apt install libmpv-dev`.
+- Without libmpv the rest of the application still works; opening a video
+  reports that the library is missing. No `mpv.lib` is needed to build.
 
 ```sh
 git clone https://github.com/MlxySF/mlxysftele.git

@@ -13,8 +13,7 @@
 //! on the GUI thread (never from the callback), which satisfies mpv's
 //! threading requirements.
 //!
-//! `#[link(name = "mpv")]` requires libmpv to be present at link time
-//! (Debian/Ubuntu: `apt install libmpv-dev`).
+//! libmpv is loaded at runtime; video playback requires a compatible shared library.
 
 use eframe::egui;
 
@@ -45,21 +44,85 @@ struct MpvRenderParam {
     data: *mut c_void,
 }
 
-#[link(name = "mpv")]
-extern "C" {
-    fn mpv_create() -> *mut c_void;
-    fn mpv_initialize(ctx: *mut c_void) -> i32;
-    fn mpv_destroy(ctx: *mut c_void);
-    fn mpv_set_option_string(ctx: *mut c_void, name: *const c_char, data: *const c_char) -> i32;
-    fn mpv_set_property_string(ctx: *mut c_void, name: *const c_char, data: *const c_char) -> i32;
-    fn mpv_command(ctx: *mut c_void, args: *const *const c_char) -> i32;
-    fn mpv_set_property(ctx: *mut c_void, name: *const c_char, format: i32, data: *mut c_void) -> i32;
-    fn mpv_get_property(ctx: *mut c_void, name: *const c_char, format: i32, data: *mut c_void) -> i32;
-    fn mpv_render_context_create(res: *mut *mut c_void, mpv: *mut c_void, params: *mut MpvRenderParam) -> i32;
-    fn mpv_render_context_set_update_callback(ctx: *mut c_void, callback: Option<extern "C" fn(*mut c_void)>, callback_ctx: *mut c_void);
-    fn mpv_render_context_update(ctx: *mut c_void) -> u64;
-    fn mpv_render_context_render(ctx: *mut c_void, params: *mut MpvRenderParam) -> i32;
-    fn mpv_render_context_free(ctx: *mut c_void);
+
+// The library stays loaded until after the render context and player are destroyed.
+struct MpvApi {
+    _library: libloading::Library,
+    mpv_create: unsafe extern "C" fn() -> *mut c_void,
+    mpv_initialize: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
+    mpv_destroy: unsafe extern "C" fn(ctx: *mut c_void),
+    mpv_set_option_string: unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char, data: *const c_char) -> i32,
+    mpv_command: unsafe extern "C" fn(ctx: *mut c_void, args: *const *const c_char) -> i32,
+    mpv_set_property: unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char, format: i32, data: *mut c_void) -> i32,
+    mpv_get_property: unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char, format: i32, data: *mut c_void) -> i32,
+    mpv_render_context_create: unsafe extern "C" fn(res: *mut *mut c_void, mpv: *mut c_void, params: *mut MpvRenderParam) -> i32,
+    mpv_render_context_set_update_callback: unsafe extern "C" fn(ctx: *mut c_void, callback: Option<extern "C" fn(*mut c_void)>, callback_ctx: *mut c_void),
+    mpv_render_context_update: unsafe extern "C" fn(ctx: *mut c_void) -> u64,
+    mpv_render_context_render: unsafe extern "C" fn(ctx: *mut c_void, params: *mut MpvRenderParam) -> i32,
+    mpv_render_context_free: unsafe extern "C" fn(ctx: *mut c_void),
+}
+
+impl MpvApi {
+    fn load() -> Result<Self, String> {
+        #[cfg(target_os = "windows")]
+        let names = ["mpv-2.dll", "libmpv-2.dll", "mpv-1.dll", "libmpv.dll", "mpv.dll"].as_slice();
+        #[cfg(target_os = "macos")]
+        let names = ["libmpv.2.dylib", "libmpv.1.dylib", "libmpv.dylib"].as_slice();
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let names = ["libmpv.so.2", "libmpv.so.1", "libmpv.so"].as_slice();
+
+        Self::load_from_names(names)
+    }
+
+    fn load_from_names(names: &[&str]) -> Result<Self, String> {
+        let mut errors = Vec::new();
+        for name in names {
+            // SAFETY: only load libraries installed by the user or shipped next to
+            // the executable. Symbols below use libmpv's documented C ABI.
+            let library = match unsafe { libloading::Library::new(*name) } {
+                Ok(library) => library,
+                Err(e) => { errors.push(format!("{name}: {e}")); continue; }
+            };
+            // SAFETY: the requested functions are the libmpv C API. Copy the
+            // function pointers while keeping the owning library in this struct.
+            let result = unsafe { Self::from_library(library) };
+            match result {
+                Ok(api) => return Ok(api),
+                Err(e) => errors.push(format!("{name}: {e}")),
+            }
+        }
+        Err(format!("libmpv not found or incompatible. Install libmpv or place its DLL beside the executable. Details: {}", errors.join("; ")))
+    }
+
+    unsafe fn from_library(library: libloading::Library) -> Result<Self, String> {
+        let mpv_create = *library.get(b"mpv_create\0").map_err(|e| e.to_string())?;
+        let mpv_initialize = *library.get(b"mpv_initialize\0").map_err(|e| e.to_string())?;
+        let mpv_destroy = *library.get(b"mpv_destroy\0").map_err(|e| e.to_string())?;
+        let mpv_set_option_string = *library.get(b"mpv_set_option_string\0").map_err(|e| e.to_string())?;
+        let mpv_command = *library.get(b"mpv_command\0").map_err(|e| e.to_string())?;
+        let mpv_set_property = *library.get(b"mpv_set_property\0").map_err(|e| e.to_string())?;
+        let mpv_get_property = *library.get(b"mpv_get_property\0").map_err(|e| e.to_string())?;
+        let mpv_render_context_create = *library.get(b"mpv_render_context_create\0").map_err(|e| e.to_string())?;
+        let mpv_render_context_set_update_callback = *library.get(b"mpv_render_context_set_update_callback\0").map_err(|e| e.to_string())?;
+        let mpv_render_context_update = *library.get(b"mpv_render_context_update\0").map_err(|e| e.to_string())?;
+        let mpv_render_context_render = *library.get(b"mpv_render_context_render\0").map_err(|e| e.to_string())?;
+        let mpv_render_context_free = *library.get(b"mpv_render_context_free\0").map_err(|e| e.to_string())?;
+        Ok(Self {
+            mpv_create,
+            mpv_initialize,
+            mpv_destroy,
+            mpv_set_option_string,
+            mpv_command,
+            mpv_set_property,
+            mpv_get_property,
+            mpv_render_context_create,
+            mpv_render_context_set_update_callback,
+            mpv_render_context_update,
+            mpv_render_context_render,
+            mpv_render_context_free,
+            _library: library,
+        })
+    }
 }
 
 /// Called by libmpv (possibly from an mpv thread) when a new frame is ready.
@@ -79,6 +142,7 @@ extern "C" fn render_update_trampoline(callback_ctx: *mut c_void) {
 const MAX_RENDER_WIDTH: i64 = 1280;
 
 pub struct VideoPlayer {
+    api: MpvApi,
     /// Opaque `mpv_handle*`.
     mpv: *mut c_void,
     /// Opaque `mpv_render_context*`.
@@ -105,8 +169,9 @@ impl VideoPlayer {
         let path_str = path.to_string_lossy().into_owned();
         let c_path = CString::new(path_str).map_err(|_| "path contains NUL".to_string())?;
 
+        let api = MpvApi::load()?;
         // SAFETY: mpv_create either returns a valid handle or null; checked below.
-        let mpv = unsafe { mpv_create() };
+        let mpv = unsafe { (api.mpv_create)() };
         if mpv.is_null() {
             return Err("mpv_create failed (is libmpv installed?)".into());
         }
@@ -123,17 +188,17 @@ impl VideoPlayer {
             let c_name = CString::new(name).unwrap();
             let c_value = CString::new(value).unwrap();
             // SAFETY: mpv and the CString args are valid for the call duration.
-            let rc = unsafe { mpv_set_option_string(mpv, c_name.as_ptr(), c_value.as_ptr()) };
+            let rc = unsafe { (api.mpv_set_option_string)(mpv, c_name.as_ptr(), c_value.as_ptr()) };
             if rc < 0 {
-                unsafe { mpv_destroy(mpv) };
+                unsafe { (api.mpv_destroy)(mpv) };
                 return Err(format!("mpv rejected option {name}={value} (error {rc})"));
             }
         }
 
         // SAFETY: mpv is a valid handle created above.
-        let rc = unsafe { mpv_initialize(mpv) };
+        let rc = unsafe { (api.mpv_initialize)(mpv) };
         if rc < 0 {
-            unsafe { mpv_destroy(mpv) };
+            unsafe { (api.mpv_destroy)(mpv) };
             return Err(format!("mpv_initialize failed (error {rc})"));
         }
 
@@ -145,9 +210,9 @@ impl VideoPlayer {
         ];
         let mut render: *mut c_void = std::ptr::null_mut();
         // SAFETY: params is a valid, terminated array; mpv and render are valid.
-        let rc = unsafe { mpv_render_context_create(&mut render, mpv, params.as_mut_ptr()) };
+        let rc = unsafe { (api.mpv_render_context_create)(&mut render, mpv, params.as_mut_ptr()) };
         if rc < 0 || render.is_null() {
-            unsafe { mpv_destroy(mpv) };
+            unsafe { (api.mpv_destroy)(mpv) };
             return Err(format!("mpv_render_context_create failed (error {rc})"));
         }
 
@@ -157,19 +222,20 @@ impl VideoPlayer {
         let frame_ready = Arc::new(AtomicBool::new(false));
         let cb_ctx = Arc::into_raw(Arc::clone(&frame_ready)) as *mut c_void;
         // SAFETY: render is valid; cb_ctx outlives the context (leaked).
-        unsafe { mpv_render_context_set_update_callback(render, Some(render_update_trampoline), cb_ctx) };
+        unsafe { (api.mpv_render_context_set_update_callback)(render, Some(render_update_trampoline), cb_ctx) };
 
         // Start decoding/playing the file.
         let c_loadfile = CString::new("loadfile").unwrap();
         let argv: [*const c_char; 3] = [c_loadfile.as_ptr(), c_path.as_ptr(), std::ptr::null()];
         // SAFETY: argv is a valid NULL-terminated argument vector.
-        let rc = unsafe { mpv_command(mpv, argv.as_ptr()) };
+        let rc = unsafe { (api.mpv_command)(mpv, argv.as_ptr()) };
         if rc < 0 {
-            unsafe { mpv_render_context_free(render); mpv_destroy(mpv) };
+            unsafe { (api.mpv_render_context_free)(render); (api.mpv_destroy)(mpv) };
             return Err(format!("mpv failed to open {} (error {rc})", path.display()));
         }
 
         Ok(VideoPlayer {
+            api,
             mpv,
             render,
             frame_ready,
@@ -189,7 +255,7 @@ impl VideoPlayer {
         // Ask mpv whether anything is pending; even without the callback this
         // keeps us correct (it also nudges ADVANCED_CONTROL-style internals).
         // SAFETY: render is valid until Drop.
-        let update = unsafe { mpv_render_context_update(self.render) };
+        let update = unsafe { (self.api.mpv_render_context_update)(self.render) };
         let callback_fired = self.frame_ready.swap(false, Ordering::Relaxed);
         if update & MPV_RENDER_UPDATE_FRAME == 0 && !callback_fired {
             return;
@@ -225,7 +291,7 @@ impl VideoPlayer {
         ];
         // SAFETY: params is a valid, terminated array; the buffer lives for the
         // call; render is valid until Drop.
-        let rc = unsafe { mpv_render_context_render(self.render, params.as_mut_ptr()) };
+        let rc = unsafe { (self.api.mpv_render_context_render)(self.render, params.as_mut_ptr()) };
         if rc < 0 {
             self.last_error = format!("mpv render failed (error {rc})");
             return;
@@ -290,7 +356,7 @@ impl VideoPlayer {
             std::ptr::null(),
         ];
         // SAFETY: argv is a valid NULL-terminated argument vector.
-        unsafe { mpv_command(self.mpv, argv.as_ptr()) };
+        unsafe { (self.api.mpv_command)(self.mpv, argv.as_ptr()) };
     }
 
     pub fn volume(&self) -> Option<f64> {
@@ -339,7 +405,7 @@ impl VideoPlayer {
         let c_name = CString::new(name).ok()?;
         let mut value: i32 = 0;
         // SAFETY: c_name is valid; value is a valid out-pointer.
-        let rc = unsafe { mpv_get_property(self.mpv, c_name.as_ptr(), MPV_FORMAT_FLAG, &mut value as *mut i32 as *mut c_void) };
+        let rc = unsafe { (self.api.mpv_get_property)(self.mpv, c_name.as_ptr(), MPV_FORMAT_FLAG, &mut value as *mut i32 as *mut c_void) };
         (rc >= 0).then_some(value != 0)
     }
 
@@ -347,28 +413,28 @@ impl VideoPlayer {
         let Some(c_name) = CString::new(name).ok() else { return };
         let value = value;
         // SAFETY: c_name is valid; value is a valid in-pointer.
-        unsafe { mpv_set_property(self.mpv, c_name.as_ptr(), MPV_FORMAT_FLAG, &value as *const i32 as *mut c_void) };
+        unsafe { (self.api.mpv_set_property)(self.mpv, c_name.as_ptr(), MPV_FORMAT_FLAG, &value as *const i32 as *mut c_void) };
     }
 
     fn get_double(&self, name: &str) -> Option<f64> {
         let c_name = CString::new(name).ok()?;
         let mut value: f64 = 0.0;
         // SAFETY: c_name is valid; value is a valid out-pointer.
-        let rc = unsafe { mpv_get_property(self.mpv, c_name.as_ptr(), MPV_FORMAT_DOUBLE, &mut value as *mut f64 as *mut c_void) };
+        let rc = unsafe { (self.api.mpv_get_property)(self.mpv, c_name.as_ptr(), MPV_FORMAT_DOUBLE, &mut value as *mut f64 as *mut c_void) };
         (rc >= 0).then_some(value)
     }
 
     fn set_double(&self, name: &str, value: f64) {
         let Some(c_name) = CString::new(name).ok() else { return };
         // SAFETY: c_name is valid; value is a valid in-pointer.
-        unsafe { mpv_set_property(self.mpv, c_name.as_ptr(), MPV_FORMAT_DOUBLE, &value as *const f64 as *mut c_void) };
+        unsafe { (self.api.mpv_set_property)(self.mpv, c_name.as_ptr(), MPV_FORMAT_DOUBLE, &value as *const f64 as *mut c_void) };
     }
 
     fn get_int64(&self, name: &str) -> Option<i64> {
         let c_name = CString::new(name).ok()?;
         let mut value: i64 = 0;
         // SAFETY: c_name is valid; value is a valid out-pointer.
-        let rc = unsafe { mpv_get_property(self.mpv, c_name.as_ptr(), MPV_FORMAT_INT64, &mut value as *mut i64 as *mut c_void) };
+        let rc = unsafe { (self.api.mpv_get_property)(self.mpv, c_name.as_ptr(), MPV_FORMAT_INT64, &mut value as *mut i64 as *mut c_void) };
         (rc >= 0).then_some(value)
     }
 }
@@ -379,11 +445,11 @@ impl Drop for VideoPlayer {
         // SAFETY: both pointers are valid until freed here; Drop runs once.
         unsafe {
             if !self.render.is_null() {
-                mpv_render_context_free(self.render);
+                (self.api.mpv_render_context_free)(self.render);
                 self.render = std::ptr::null_mut();
             }
             if !self.mpv.is_null() {
-                mpv_destroy(self.mpv);
+                (self.api.mpv_destroy)(self.mpv);
                 self.mpv = std::ptr::null_mut();
             }
         }
@@ -395,7 +461,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_library_returns_actionable_error() {
+        let error = match MpvApi::load_from_names(&["mlxysftele-nonexistent-libmpv-12345.dll"]) {
+            Ok(_) => panic!("unexpectedly loaded nonexistent library"),
+            Err(error) => error,
+        };
+        assert!(error.contains("libmpv not found or incompatible"));
+    }
+
+    #[test]
     fn initializes_software_renderer() {
+        // Windows build CI first tests without an mpv DLL, then sets this
+        // variable after installing the DLL to exercise actual initialization.
+        if cfg!(target_os = "windows") && std::env::var_os("MLXYSFTELE_TEST_MPV").is_none() {
+            return;
+        }
         // Opening a missing file is asynchronous; this exercises initialization
         // and verifies our mpv options and SW renderer without a display.
         let player = VideoPlayer::open(Path::new("/nonexistent-mlxysftele-video.mp4"), "test");

@@ -37,6 +37,7 @@ grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "fa7692e
 grammers-session = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
 # The whole point: a native, ZapFast-style GUI with no web view.
 eframe = { version = "0.37", default-features = true }
+libloading = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Decode images received in chats for inline display.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
