@@ -3115,6 +3115,46 @@ mod message_cache_tests {
     }
 
     #[test]
+    fn only_focused_loaded_chat_is_marked_read_and_old_ack_keeps_new_message() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        let peer = PeerId::user(1);
+        let key = ("account".to_string(), peer);
+        app.sel_account = Some(key.0.clone());
+        app.sel_peer.insert(key.0.clone(), peer);
+        app.chats.insert(key.clone(), vec![photo(10, "loaded")]);
+        app.unread.incoming(&key.0, peer, 10);
+
+        let raw = egui::RawInput { focused: false, ..Default::default() };
+        ctx.run_ui(raw, |ui| app.mark_visible_chat_read(ui.ctx())).drop_without_applying_deltas();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app.unread.any());
+
+        let raw = egui::RawInput { focused: true, ..Default::default() };
+        ctx.run_ui(raw, |ui| app.mark_visible_chat_read(ui.ctx())).drop_without_applying_deltas();
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::MarkRead { max_id: 10, .. })));
+        app.unread.incoming(&key.0, peer, 11);
+        app.apply_event(Evt::ReadResult { account: key.0.clone(), peer_id: peer, max_id: 10, result: Ok(()) });
+        assert_eq!(app.unread.newest(&key.0, peer), Some(11));
+        app.apply_event(Evt::ReadUpdate { account: key.0.clone(), peer_id: peer, max_id: 11, remaining: 0 });
+        assert!(!app.unread.any());
+    }
+
+    #[test]
+    fn failed_read_leaves_unread_and_alarm_state() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.unread.incoming("account", peer, 7);
+        app.apply_event(Evt::ReadResult { account: "account".into(), peer_id: peer, max_id: 7, result: Err("offline".into()) });
+        assert!(app.unread.any());
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
     fn distinct_message_ids_are_not_deduplicated_and_cache_is_bounded() {
         let mut chat = Vec::new();
         for id in 0..=MAX_CACHED_MESSAGES as i32 {

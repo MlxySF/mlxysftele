@@ -33,25 +33,19 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --all-targets 2>&1 | tee /tmp/cargo-test.log
-
-      - name: Report lockfile changes temporarily
-        if: always()
-        shell: bash
-        run: |
-          python3 -c 'import subprocess,base64,zlib; d=subprocess.check_output(["git","diff","--binary","--","Cargo.lock"]); b=base64.b64encode(zlib.compress(d)).decode(); [print("::notice::LOCKPATCH%04d:" % i + b[i*3000:(i+1)*3000]) for i in range((len(b)+2999)//3000)]'
+          cargo test --locked --all-targets 2>&1 | tee /tmp/cargo-test.log
 
       - name: Annotate cargo test failures
         if: failure()
         run: python3 ci/annotate.py /tmp/cargo-test.log
 
-      - name: cargo build --release
+      - name: cargo build --locked --release
         id: release
         if: success()
         shell: bash
         run: |
           set -o pipefail
-          cargo build --release 2>&1 | tee /tmp/cargo-release.log
+          cargo build --locked --release 2>&1 | tee /tmp/cargo-release.log
 
       - name: Annotate cargo build failures
         if: failure()
@@ -77,9 +71,16 @@ jobs:
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
       - name: Test without libmpv import library
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
       - name: Build release without libmpv import library
-        run: cargo build --release
+        run: cargo build --locked --release
+      - name: Verify Windows GUI subsystem
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path .\target\release\mlxysftele.exe))
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
+          if ($subsystem -ne 2) { throw "Expected Windows GUI subsystem (2), got $subsystem" }
       - name: Smoke test redirected CLI output
         shell: pwsh
         run: |
@@ -102,4 +103,4 @@ jobs:
         shell: pwsh
         env:
           MLXYSFTELE_TEST_MPV: 1
-        run: cargo test initializes_software_renderer
+        run: cargo test --locked initializes_software_renderer

@@ -3,7 +3,7 @@
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use rodio::{OutputStreamBuilder, Sink, Source};
+use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
 
 const REPEAT: Duration = Duration::from_secs(5);
 
@@ -17,7 +17,7 @@ impl Alarm {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("unread-alarm".into())
-            .spawn(move || run(rx, report_error))
+            .spawn(move || run(rx, REPEAT, AudioOutput::open, report_error))
             .expect("failed to start alarm thread");
         Self { tx, active: false }
     }
@@ -30,41 +30,105 @@ impl Alarm {
     }
 }
 
-fn run(rx: Receiver<bool>, report_error: impl Fn(String)) {
+trait Beeper {
+    fn beep(&mut self);
+    fn stop(&mut self);
+}
+
+struct AudioOutput {
+    sink: Sink,
+    // The stream must stay alive until the sink has stopped.
+    _stream: OutputStream,
+}
+impl AudioOutput {
+    fn open() -> Result<Self, String> {
+        let mut stream = OutputStreamBuilder::open_default_stream().map_err(|e| e.to_string())?;
+        stream.log_on_drop(false);
+        let sink = Sink::connect_new(stream.mixer());
+        Ok(Self { sink, _stream: stream })
+    }
+}
+impl Beeper for AudioOutput {
+    fn beep(&mut self) {
+        if self.sink.empty() {
+            self.sink.append(rodio::source::SineWave::new(880.0)
+                .take_duration(Duration::from_millis(300)).amplify(0.18));
+        }
+    }
+    fn stop(&mut self) { self.sink.stop(); }
+}
+
+fn run<B: Beeper>(
+    rx: Receiver<bool>,
+    interval: Duration,
+    mut open: impl FnMut() -> Result<B, String>,
+    report_error: impl Fn(String),
+) {
+    let mut active = false;
     let mut reported = false;
-    while let Ok(active) = rx.recv() {
-        if !active { continue; }
-        'active: loop {
-            let mut stream = match OutputStreamBuilder::open_default_stream() {
-                Ok(stream) => { reported = false; Some(stream) }
-                Err(e) => {
-                    if !reported {
-                        report_error(format!("Unread alarm: cannot open audio output: {e}"));
-                        reported = true;
-                    }
-                    None
-                }
-            };
-            if let Some(ref mut stream) = stream { stream.log_on_drop(false); }
-            let sink = stream.as_ref().map(|stream| Sink::connect_new(stream.mixer()));
-            loop {
-                if let Some(ref sink) = sink {
-                    if sink.empty() {
-                        sink.append(rodio::source::SineWave::new(880.0)
-                            .take_duration(Duration::from_millis(300)).amplify(0.18));
+    loop {
+        if !active {
+            match rx.recv() {
+                Ok(true) => active = true,
+                Ok(false) => continue,
+                Err(_) => return,
+            }
+        }
+        match open() {
+            Ok(mut output) => {
+                reported = false;
+                while active {
+                    output.beep();
+                    match rx.recv_timeout(interval) {
+                        Ok(false) => active = false,
+                        Ok(true) | Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => { output.stop(); return; }
                     }
                 }
-                match rx.recv_timeout(REPEAT) {
-                    Ok(false) | Err(RecvTimeoutError::Disconnected) => {
-                        if let Some(sink) = sink { sink.stop(); }
-                        break 'active;
-                    }
-                    Ok(true) => {}
-                    Err(RecvTimeoutError::Timeout) if stream.is_none() => break, // retry device
-                    Err(RecvTimeoutError::Timeout) => {}
+                output.stop();
+            }
+            Err(error) => {
+                if !reported {
+                    report_error(format!("Unread alarm: cannot open audio output: {error}"));
+                    reported = true;
+                }
+                match rx.recv_timeout(interval) {
+                    Ok(false) => active = false,
+                    Ok(true) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
-            // No audio device: retry after REPEAT, while still listening for stop.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Fake(Sender<&'static str>);
+    impl Beeper for Fake {
+        fn beep(&mut self) { self.0.send("beep").unwrap(); }
+        fn stop(&mut self) { self.0.send("stop").unwrap(); }
+    }
+    #[test]
+    fn repeats_until_stopped_and_starts_again() {
+        let (tx, rx) = mpsc::channel();
+        let (events, observed) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            run(rx, Duration::from_millis(20), || Ok::<_, String>(Fake(events.clone())), |_| {});
+        });
+        tx.send(true).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), "beep");
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), "beep");
+        tx.send(false).unwrap();
+        // A beep already queued before the stop signal is harmless.
+        while observed.recv_timeout(Duration::from_secs(1)).unwrap() != "stop" {}
+        assert!(observed.recv_timeout(Duration::from_millis(80)).is_err());
+        tx.send(true).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), "beep");
+        tx.send(false).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), "stop");
+        drop(tx);
+        handle.join().unwrap();
     }
 }
