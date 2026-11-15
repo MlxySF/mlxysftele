@@ -85,6 +85,14 @@ an OpenGL-capable system and graphics driver.
   at runtime, so the application builds and runs without it; playback requires
   installing the shared library as described below. Video files land in
   `<data_dir>/cache/media/` like photos.
+- **Repeated unread alarm** — a short alert repeats every five seconds while
+  any connected account has unread messages, including while the window is
+  minimized. It stops when all are read here or on another Telegram device.
+  Opening a chat in the focused, visible window marks the loaded messages read
+  on Telegram; a failed read request leaves the alert active and is retried.
+  Audio requires a working default output device and system volume; if opening
+  the device fails, the app displays an error and retries. The app must remain
+  running and connected; unread counts are loaded from Telegram at startup.
 - **Keyboard flow** — Esc closes, in order: the image viewer, the video
   player, the file picker, Settings, the add-account window, and finally the
   open chat (back to "pick a chat").
@@ -107,7 +115,11 @@ an OpenGL-capable system and graphics driver.
 
 Prerequisites: Rust **1.95+** and network access to `github.com` (git-pinned
 grammers), `crates.io`, and Telegram's datacenters. On Linux you need the
-usual GUI build libraries, e.g. `sudo apt install libwayland-dev libxkbcommon-dev`.
+usual GUI and audio build libraries, e.g. `sudo apt install libwayland-dev libxkbcommon-dev libasound2-dev`.
+On Windows the GUI executable uses the Windows subsystem, so double-clicking it
+no longer creates an extra console. CLI commands attach to an existing parent
+console when available; PowerShell may return its prompt before a GUI-subsystem
+process finishes, so use `Start-Process -Wait` when waiting is important.
 
 For embedded video playback, install the libmpv runtime separately:
 

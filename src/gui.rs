@@ -15,8 +15,8 @@
 //!   the sidebar instead of being dropped.
 //!
 //! RAM note: chat history is capped at [`MAX_CACHED_MESSAGES`] per dialog and
-//! the dialog list at [`MAX_DIALOGS`] — a client that renders everything it
-//! has ever seen would not be ZapFast-style.
+//! history per dialog — a client that renders everything it has ever seen
+//! would not be ZapFast-style.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,9 +31,12 @@ use grammers_client::update::Update;
 use grammers_session::types::PeerId;
 use grammers_session::types::PeerRef;
 use grammers_client::Client;
+use grammers_tl_types as tl;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::alarm::Alarm;
+use crate::unread::Unread;
 use crate::config::{AccountMeta, Config};
 use crate::premium::{self, PremiumToggles};
 use crate::telegram;
@@ -41,8 +44,6 @@ use crate::video::VideoPlayer;
 use crate::util;
 use crate::{log_err, log_warn};
 
-/// Cap for cached dialogs per account.
-const MAX_DIALOGS: usize = 150;
 /// Cap for cached messages per open dialog.
 const MAX_CACHED_MESSAGES: usize = 100;
 /// Messages fetched when a dialog is opened.
@@ -58,6 +59,7 @@ enum Cmd {
     SaveCreds { api_id: i32, api_hash: String },
     RefreshDialogs { account: String },
     OpenChat { account: String, peer_id: PeerId },
+    MarkRead { account: String, peer_id: PeerId, max_id: i32 },
     SendText { account: String, peer_id: PeerId, text: String },
     /// Send a local image file as a photo; `caption` may be empty.
     SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String },
@@ -81,6 +83,9 @@ struct DialogItem {
     peer_id: PeerId,
     name: String,
     preview: Option<String>,
+    unread_count: u32,
+    top_message: i32,
+    read_inbox_max_id: i32,
 }
 
 /// Media carried by a chat message.
@@ -191,6 +196,8 @@ enum Evt {
         /// Photo vs video — decides whether the GUI decodes a texture or opens the player.
         kind: MsgMedia,
     },
+    ReadUpdate { account: String, peer_id: PeerId, max_id: i32, remaining: u32 },
+    ReadResult { account: String, peer_id: PeerId, max_id: i32, result: Result<(), String> },
     VideoError { cache_key: String, message: String },
     Login { name: String, state: LoginEvt },
     Toast(String),
@@ -568,6 +575,19 @@ impl Worker {
                             });
                             ctx.request_repaint();
                         }
+                        Ok(Update::Raw(update)) => {
+                            let read = match update.raw {
+                                tl::enums::Update::ReadHistoryInbox(ref r) if r.top_msg_id.is_none() =>
+                                    Some((r.peer.clone().into(), r.max_id, r.still_unread_count.max(0) as u32)),
+                                tl::enums::Update::ReadChannelInbox(ref r) =>
+                                    Some((PeerId::channel(r.channel_id), r.max_id, r.still_unread_count.max(0) as u32)),
+                                _ => None,
+                            };
+                            if let Some((peer_id, max_id, remaining)) = read {
+                                let _ = evt_tx.send(Evt::ReadUpdate { account: account.clone(), peer_id, max_id, remaining });
+                                ctx.request_repaint();
+                            }
+                        }
                         Ok(_) => {}
                         Err(e) => {
                             let _ = evt_tx.send(Evt::Status {
@@ -592,8 +612,10 @@ impl Worker {
 
     async fn refresh_dialogs(&mut self, name: &str) {
         let Some(conn) = self.conns.get_mut(name) else { return };
-        let mut iter = conn.client.iter_dialogs().limit(MAX_DIALOGS);
-        let mut items = Vec::with_capacity(MAX_DIALOGS);
+        // Fetch every dialog so an unread chat beyond an arbitrary UI limit
+        // can still trigger the alarm at startup.
+        let mut iter = conn.client.iter_dialogs();
+        let mut items = Vec::new();
         while let Ok(Some(dialog)) = iter.next().await {
             let peer_id = dialog.peer_id();
             let peer_ref = dialog.peer_ref();
@@ -610,10 +632,17 @@ impl Worker {
                 let p = p.trim().to_string();
                 if p.is_empty() { None } else { Some(truncate(&p, 80)) }
             });
+            let (unread_count, top_message, read_inbox_max_id) = match &dialog.raw {
+                tl::enums::Dialog::Dialog(raw) => (raw.unread_count.max(0) as u32, raw.top_message, raw.read_inbox_max_id),
+                _ => continue,
+            };
             items.push(DialogItem {
                 peer_id,
                 name: dialog.peer().name().unwrap_or("?").to_string(),
                 preview,
+                unread_count,
+                top_message,
+                read_inbox_max_id,
             });
         }
         self.emit(Evt::Dialogs { name: name.to_string(), items });
@@ -628,7 +657,15 @@ impl Worker {
         let mut iter = conn.client.iter_messages(peer_ref).limit(HISTORY_PAGE);
         let mut messages = Vec::with_capacity(HISTORY_PAGE);
         let mut downloads = Vec::new();
-        while let Ok(Some(message)) = iter.next().await {
+        loop {
+            let message = match iter.next().await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(e) => {
+                    self.emit(Evt::Toast(format!("history failed: {e}")));
+                    return;
+                }
+            };
             let id = message.id();
             let media = split_media(&message);
             let msg = MsgItem {
@@ -680,6 +717,20 @@ impl Worker {
                 );
             }
         }
+    }
+
+    async fn mark_read(&mut self, account: &str, peer_id: PeerId, max_id: i32) {
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            None => Err("account or chat is not connected".to_string()),
+            Some((client, peer)) => {
+                if peer_id.kind() == grammers_session::types::PeerKind::Channel {
+                    client.invoke(&tl::functions::channels::ReadHistory { channel: peer.into(), max_id }).await.map(|_| ()).map_err(|e| e.to_string())
+                } else {
+                    client.invoke(&tl::functions::messages::ReadHistory { peer: peer.into(), max_id }).await.map(|_| ()).map_err(|e| e.to_string())
+                }
+            }
+        };
+        self.emit(Evt::ReadResult { account: account.to_string(), peer_id, max_id, result });
     }
 
     async fn send_text(&mut self, account: &str, peer_id: PeerId, text: String) {
@@ -1050,6 +1101,7 @@ impl Worker {
                 }
                 Cmd::RefreshDialogs { account } => self.refresh_dialogs(&account).await,
                 Cmd::OpenChat { account, peer_id } => self.fetch_history(&account, peer_id).await,
+                Cmd::MarkRead { account, peer_id, max_id } => self.mark_read(&account, peer_id, max_id).await,
                 Cmd::SendText { account, peer_id, text } => {
                     self.send_text(&account, peer_id, text).await
                 }
@@ -1194,7 +1246,11 @@ struct TelegramApp {
     filter: String,
     sel_peer: HashMap<String, PeerId>,
     chats: HashMap<(String, PeerId), Vec<MsgItem>>,
-    unread: HashMap<(String, PeerId), u32>,
+    unread: Unread,
+    pending_reads: HashMap<(String, PeerId), i32>,
+    last_read_attempt: HashMap<(String, PeerId), Instant>,
+    alarm: Alarm,
+    alarm_errors: std_mpsc::Receiver<String>,
     composer: String,
     toast: Option<(String, Instant)>,
     show_settings: bool,
@@ -1218,6 +1274,12 @@ impl TelegramApp {
     ) -> Self {
         let api_id_draft = cfg.api_id.map(|id| id.to_string()).unwrap_or_default();
         let api_hash_draft = cfg.api_hash.clone().unwrap_or_default();
+        let (alarm_tx, alarm_errors) = std_mpsc::channel();
+        let alarm_ctx = ctx.clone();
+        let alarm = Alarm::new(move |error| {
+            let _ = alarm_tx.send(error);
+            alarm_ctx.request_repaint();
+        });
         let mut app = Self {
             cfg,
             cmd_tx,
@@ -1230,7 +1292,11 @@ impl TelegramApp {
             filter: String::new(),
             sel_peer: HashMap::new(),
             chats: HashMap::new(),
-            unread: HashMap::new(),
+            unread: Unread::default(),
+            pending_reads: HashMap::new(),
+            last_read_attempt: HashMap::new(),
+            alarm,
+            alarm_errors,
             composer: String::new(),
             toast: None,
             show_settings: false,
@@ -1272,7 +1338,9 @@ impl TelegramApp {
                 self.sel_peer.retain(|k, _| known.contains(k));
                 self.last_auto_refresh.retain(|k, _| known.contains(k));
                 self.chats.retain(|(a, _), _| known.contains(a));
-                self.unread.retain(|(a, _), _| known.contains(a));
+                self.unread.retain_accounts(&known);
+                self.pending_reads.retain(|(a, _), _| known.contains(a));
+                self.last_read_attempt.retain(|(a, _), _| known.contains(a));
                 if let Some(sel) = &self.sel_account {
                     if !known.contains(sel) {
                         self.sel_account = None;
@@ -1290,6 +1358,9 @@ impl TelegramApp {
                 self.me.insert(name, me);
             }
             Evt::Dialogs { name, items } => {
+                for dialog in &items {
+                    self.unread.snapshot(&name, dialog.peer_id, dialog.unread_count, dialog.top_message, dialog.read_inbox_max_id);
+                }
                 self.dialogs.insert(name, items);
             }
             Evt::History { account, peer_id, messages } => {
@@ -1301,14 +1372,13 @@ impl TelegramApp {
                 }
             }
             Evt::Incoming { account, peer_id, msg } => {
-                let is_open = self.sel_account.as_deref() == Some(account.as_str())
-                    && self.sel_peer.get(&account) == Some(&peer_id);
                 let outgoing = msg.outgoing;
+                let message_id = msg.id;
                 let is_new = self.chats.get_mut(&(account.clone(), peer_id))
                     .map(|chat| upsert_chat_message(chat, msg))
                     .unwrap_or(true);
-                if !is_open && !outgoing && is_new {
-                    *self.unread.entry((account.clone(), peer_id)).or_insert(0) += 1;
+                if !outgoing && is_new {
+                    self.unread.incoming(&account, peer_id, message_id);
                 }
                 // Unknown peer? Refresh the dialog list (throttled).
                 let known = self
@@ -1378,6 +1448,19 @@ impl TelegramApp {
                         }
                         self.decode_into_textures(&cache_key, &path);
                     }
+                }
+            }
+            Evt::ReadUpdate { account, peer_id, max_id, remaining } => {
+                self.unread.read(&account, peer_id, max_id, Some(remaining));
+                if remaining > 0 {
+                    self.send_cmd(Cmd::RefreshDialogs { account });
+                }
+            }
+            Evt::ReadResult { account, peer_id, max_id, result } => {
+                self.pending_reads.remove(&(account.clone(), peer_id));
+                match result {
+                    Ok(()) => self.unread.read(&account, peer_id, max_id, None),
+                    Err(error) => self.toast = Some((format!("Could not mark chat read: {error}"), Instant::now())),
                 }
             }
             Evt::VideoError { cache_key, message } => {
@@ -1476,7 +1559,6 @@ impl TelegramApp {
             self.sel_peer.insert(account.clone(), peer_id);
             self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
             self.pending_attachment = None;
-            self.unread.remove(&(account.clone(), peer_id));
             if !self.chats.contains_key(&(account.clone(), peer_id)) {
                 self.send_cmd(Cmd::OpenChat { account, peer_id });
             }
@@ -1602,10 +1684,15 @@ fn format_msg_time(unix: i64) -> String {
 
 impl eframe::App for TelegramApp {
     /// Background logic: drain worker events. No painting here.
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(evt) = self.evt_rx.try_recv() {
             self.apply_event(evt);
         }
+        while let Ok(error) = self.alarm_errors.try_recv() {
+            self.toast = Some((error, Instant::now()));
+        }
+        self.mark_visible_chat_read(ctx);
+        self.alarm.set_active(self.unread.any());
         if let Some((_, since)) = &self.toast {
             if since.elapsed() > Duration::from_secs(6) {
                 self.toast = None;
@@ -1703,6 +1790,34 @@ impl eframe::App for TelegramApp {
 }
 
 impl TelegramApp {
+    /// Only acknowledge messages after their history has loaded in the focused,
+    /// visible window. Do not mark a hidden account/chat or an overlaid chat read.
+    fn mark_visible_chat_read(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.focused && i.viewport().visible() != Some(false))
+            || self.show_settings || self.show_add || self.show_picker || self.viewer.is_some() || self.video.is_some() {
+            return;
+        }
+        let Some(account) = self.sel_account.clone() else { return };
+        let Some(&peer_id) = self.sel_peer.get(&account) else { return };
+        let key = (account.clone(), peer_id);
+        let Some(history) = self.chats.get(&key) else { return };
+        if self.pending_reads.contains_key(&key) { return; }
+        let Some(max_id) = self.unread.newest(&account, peer_id) else { return };
+        // A stale cache does not prove the newest unread has actually appeared.
+        let history_is_current = history.iter().map(|message| message.id).max().unwrap_or(0) >= max_id;
+        if self.last_read_attempt.get(&key).is_some_and(|time| time.elapsed() < Duration::from_secs(5)) {
+            ctx.request_repaint_after(Duration::from_secs(5));
+            return;
+        }
+        self.last_read_attempt.insert(key.clone(), Instant::now());
+        if !history_is_current {
+            self.send_cmd(Cmd::OpenChat { account, peer_id });
+            return;
+        }
+        self.pending_reads.insert(key, max_id);
+        self.send_cmd(Cmd::MarkRead { account, peer_id, max_id });
+    }
+
     fn ui_topbar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("topbar")
             .show_separator_line(false)
@@ -1867,7 +1982,7 @@ impl TelegramApp {
                     continue;
                 }
                 let selected = self.sel_peer.get(&account) == Some(&dialog.peer_id);
-                let unread = self.unread.get(&(account.clone(), dialog.peer_id)).copied().unwrap_or(0);
+                let unread = self.unread.count(&account, dialog.peer_id);
                 let name = dialog.name.clone();
                 let preview = dialog.preview.clone();
                 let text = ui.visuals().text_color();
@@ -2978,7 +3093,7 @@ mod message_cache_tests {
             if sent_first { app.apply_event(sent); app.apply_event(incoming); }
             else { app.apply_event(incoming); app.apply_event(sent); }
             assert_eq!(app.chats[&key].len(), 1);
-            assert!(app.unread.is_empty());
+            assert!(!app.unread.any());
             assert_eq!(app.chats[&other_account_key][0].text, "other account");
             assert_eq!(app.chats[&other_peer_key][0].text, "other peer");
         }

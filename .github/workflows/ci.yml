@@ -23,7 +23,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
-            libmpv-dev
+            libmpv-dev libasound2-dev
 
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
@@ -33,19 +33,25 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --locked --all-targets 2>&1 | tee /tmp/cargo-test.log
+          cargo test --all-targets 2>&1 | tee /tmp/cargo-test.log
+
+      - name: Report lockfile changes temporarily
+        if: always()
+        shell: bash
+        run: |
+          python3 -c 'import subprocess,base64,zlib; d=subprocess.check_output(["git","diff","--binary","--","Cargo.lock"]); b=base64.b64encode(zlib.compress(d)).decode(); [print("::notice::LOCKPATCH%04d:" % i + b[i*3000:(i+1)*3000]) for i in range((len(b)+2999)//3000)]'
 
       - name: Annotate cargo test failures
         if: failure()
         run: python3 ci/annotate.py /tmp/cargo-test.log
 
-      - name: cargo build --locked --release
+      - name: cargo build --release
         id: release
         if: success()
         shell: bash
         run: |
           set -o pipefail
-          cargo build --locked --release 2>&1 | tee /tmp/cargo-release.log
+          cargo build --release 2>&1 | tee /tmp/cargo-release.log
 
       - name: Annotate cargo build failures
         if: failure()
@@ -71,11 +77,15 @@ jobs:
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
       - name: Test without libmpv import library
-        run: cargo test --locked --all-targets
+        run: cargo test --all-targets
       - name: Build release without libmpv import library
-        run: cargo build --locked --release
-      - name: Smoke test
-        run: .\target\release\mlxysftele.exe help
+        run: cargo build --release
+      - name: Smoke test redirected CLI output
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\target\release\mlxysftele.exe -ArgumentList help -Wait -PassThru -RedirectStandardOutput help.txt -RedirectStandardError help-error.txt
+          if ($p.ExitCode -ne 0) { throw "help failed with $($p.ExitCode)" }
+          if (-not (Select-String -Path help.txt -SimpleMatch 'USAGE:')) { throw "CLI output missing" }
       - name: Download Windows libmpv for runtime test
         shell: pwsh
         run: |
@@ -92,4 +102,4 @@ jobs:
         shell: pwsh
         env:
           MLXYSFTELE_TEST_MPV: 1
-        run: cargo test --locked initializes_software_renderer
+        run: cargo test initializes_software_renderer

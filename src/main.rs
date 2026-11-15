@@ -5,10 +5,13 @@
 //! CLI commands below remain for scripting, servers and headless VPS use.
 //! See README.md and docs/LOCAL_PREMIUM.md.
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod alarm;
 mod config;
 mod daemon;
 mod gui;
@@ -16,6 +19,7 @@ mod log;
 mod lowmem;
 mod premium;
 mod telegram;
+mod unread;
 mod util;
 mod video;
 
@@ -120,11 +124,15 @@ fn main() -> ExitCode {
         return match gui::run(util::data_dir()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("error: {e}");
+                report_gui_error(&format!("Unable to start mlxysftele: {e}"));
                 ExitCode::from(1)
             }
         };
     }
+    // A GUI-subsystem executable does not get a new console on double-click.
+    // For CLI commands, attach to the existing parent console if there is one.
+    #[cfg(target_os = "windows")]
+    unsafe { AttachConsole(u32::MAX); }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -137,6 +145,27 @@ fn main() -> ExitCode {
     };
     runtime.block_on(dispatch(argv))
 }
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn AttachConsole(process_id: u32) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn report_gui_error(message: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(hwnd: *mut std::ffi::c_void, text: *const u16, caption: *const u16, flags: u32) -> i32;
+    }
+    let text: Vec<u16> = std::ffi::OsStr::new(message).encode_wide().chain(Some(0)).collect();
+    let title: Vec<u16> = std::ffi::OsStr::new("mlxysftele").encode_wide().chain(Some(0)).collect();
+    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10); }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn report_gui_error(message: &str) { eprintln!("{message}"); }
 
 async fn dispatch(argv: Vec<String>) -> ExitCode {
     let Some(cmd) = argv.first().cloned() else {

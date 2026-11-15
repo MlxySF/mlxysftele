@@ -35,12 +35,14 @@ grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "fa7692e
 # Direct dependency on grammers-session so we can open SqliteSession files and
 # name the UpdatesLike type. Default features pull in `sqlite-storage`.
 grammers-session = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
+grammers-tl-types = { git = "https://github.com/Lonami/grammers", rev = "fa7692e49f301f16dc671c2f305ac1a32cad1a8e" }
 # ZapFast's native egui approach: use its lightweight OpenGL/Glow renderer,
 # not wgpu or a browser. Retain clipboard, system fonts, and accessibility.
 eframe = { version = "0.37", default-features = false, features = [
     "accesskit", "clipboard", "default_fonts", "glow", "links", "system_fonts", "wayland", "x11"
 ] }
 libloading = "0.8"
+rodio = { version = "0.21.1", default-features = false, features = ["playback"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Decode images received in chats for inline display.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
