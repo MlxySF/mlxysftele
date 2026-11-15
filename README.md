@@ -51,7 +51,8 @@ enabled. We do not currently use Fastframe: ZapFast's Fastframe release targets
 a different egui version, and adding a second egui version would not share our
 widgets. This is an architectural adaptation, not a feature-for-feature port or
 a claim of the same memory usage. Idle RAM depends on platform and connected
-accounts and has not yet been benchmarked for this configuration.
+accounts and has not yet been benchmarked for this configuration. Glow requires
+an OpenGL-capable system and graphics driver.
 
 ## Features
 
