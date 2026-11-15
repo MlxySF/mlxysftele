@@ -1374,10 +1374,13 @@ impl TelegramApp {
             Evt::Incoming { account, peer_id, msg } => {
                 let outgoing = msg.outgoing;
                 let message_id = msg.id;
-                let is_new = self.chats.get_mut(&(account.clone(), peer_id))
-                    .map(|chat| upsert_chat_message(chat, msg))
-                    .unwrap_or(true);
-                if !outgoing && is_new {
+                if let Some(chat) = self.chats.get_mut(&(account.clone(), peer_id)) {
+                    upsert_chat_message(chat, msg);
+                }
+                // A history fetch can populate the message before its live
+                // update arrives. Deduplicate unread independently of the
+                // chat cache; the unread tracker has its own read watermark.
+                if !outgoing {
                     self.unread.incoming(&account, peer_id, message_id);
                 }
                 // Unknown peer? Refresh the dialog list (throttled).
@@ -3140,6 +3143,21 @@ mod message_cache_tests {
         assert_eq!(app.unread.newest(&key.0, peer), Some(11));
         app.apply_event(Evt::ReadUpdate { account: key.0.clone(), peer_id: peer, max_id: 11, remaining: 0 });
         assert!(!app.unread.any());
+    }
+
+    #[test]
+    fn live_incoming_is_unread_even_if_history_cached_it_first() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let mut msg = photo(10, "incoming");
+        msg.outgoing = false;
+        app.chats.insert(("account".into(), peer), vec![msg.clone()]);
+        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg: msg.clone() });
+        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg });
+        assert_eq!(app.unread.count("account", peer), 1);
+        assert_eq!(app.chats[&(String::from("account"), peer)].len(), 1);
     }
 
     #[test]
