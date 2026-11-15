@@ -39,7 +39,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python3 -c 'import subprocess,base64,zlib; d=subprocess.check_output(["git","diff","--binary","--","Cargo.lock"]); b=base64.b64encode(zlib.compress(d)).decode(); print("::notice::LOCKPATCH:"+b)'
+          python3 -c 'import subprocess,base64,zlib; d=subprocess.check_output(["git","diff","--binary","--","Cargo.lock"]); b=base64.b64encode(zlib.compress(d)).decode(); [print("::notice::LOCKPATCH%04d:" % i + b[i*3000:(i+1)*3000]) for i in range((len(b)+2999)//3000)]'
 
       - name: Annotate cargo test failures
         if: failure()
