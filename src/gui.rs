@@ -1118,6 +1118,8 @@ pub fn run(data_dir: PathBuf) -> Result<(), telegram::BoxError> {
     let cfg = Config::load(&data_dir).unwrap_or_default();
     let show_add = cfg.accounts.is_empty();
     let options = eframe::NativeOptions {
+        // Like ZapFast, draw native egui widgets with Glow rather than wgpu.
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 730.0])
             .with_min_inner_size([880.0, 560.0])
@@ -1459,6 +1461,9 @@ impl TelegramApp {
     fn select_account(&mut self, name: String) {
         self.sel_account = Some(name.clone());
         self.pending_attachment = None;
+        if self.sel_peer.contains_key(&name) {
+            self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+        }
         // Lazily load dialogs the first time the account is picked.
         let online = self.status.get(&name) == Some(&ConnStatus::Online);
         if online && self.dialogs.get(&name).map(|d| d.is_empty()).unwrap_or(true) {
@@ -1469,6 +1474,7 @@ impl TelegramApp {
     fn select_peer(&mut self, peer_id: PeerId) {
         if let Some(account) = self.sel_account.clone() {
             self.sel_peer.insert(account.clone(), peer_id);
+            self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
             self.pending_attachment = None;
             self.unread.remove(&(account.clone(), peer_id));
             if !self.chats.contains_key(&(account.clone(), peer_id)) {
@@ -1484,6 +1490,11 @@ impl TelegramApp {
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "chat".to_string())
     }
+}
+
+/// Stable id lets navigation return keyboard focus to the chat composer.
+fn composer_id() -> egui::Id {
+    egui::Id::new("message_composer")
 }
 
 fn is_image_file(path: &std::path::Path) -> bool {
@@ -1987,6 +1998,7 @@ impl TelegramApp {
                     }
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.composer)
+                            .id(composer_id())
                             .hint_text(format!("Message {peer_name}…"))
                             .desired_width(ui.available_width() - 178.0),
                     );
@@ -2001,6 +2013,7 @@ impl TelegramApp {
                         )
                         .clicked();
                     if enter || send_clicked {
+                        response.request_focus();
                         let text = self.composer.trim().to_string();
                         let attachment = self.pending_attachment.take();
                         self.composer.clear();
@@ -2969,6 +2982,21 @@ mod message_cache_tests {
             assert_eq!(app.chats[&other_account_key][0].text, "other account");
             assert_eq!(app.chats[&other_peer_key][0].text, "other peer");
         }
+    }
+
+    #[test]
+    fn selecting_a_chat_focuses_the_composer() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        app.sel_account = Some("account".into());
+        app.select_peer(PeerId::user(1));
+        assert!(ctx.memory(|memory| memory.has_focus(composer_id())));
+        app.select_account("other".into());
+        ctx.memory_mut(|memory| memory.surrender_focus(composer_id()));
+        app.select_account("account".into());
+        assert!(ctx.memory(|memory| memory.has_focus(composer_id())));
     }
 
     #[test]

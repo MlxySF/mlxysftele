@@ -36,6 +36,23 @@ native binding):
 [zapfast-bench]: https://zapfast.rocks/benchmarks/
 [sysfix]: https://yoursystemfixer.com/whatsapp-high-ram-usage-windows-11-alternatives/
 
+## How the GUI relates to ZapFast
+
+[ZapFast](https://github.com/crmne/zapfast) is a **native WhatsApp client**,
+not Telegram Web or an Electron/webview wrapper. It uses Rust, egui/eframe and
+an OpenGL (Glow) renderer; it connects through the WhatsApp Web protocol using
+`whatsapp-rust`. Its additional Fastframe crates provide desktop integrations.
+
+mlxysftele follows the same native egui/eframe + Glow approach, with the GUI on
+its own thread and Telegram work on a background Tokio runtime communicating
+through commands and events. It uses Telegram MTProto via grammers, not the
+WhatsApp protocol. Clipboard image paste, accessibility and system fonts stay
+enabled. We do not currently use Fastframe: ZapFast's Fastframe release targets
+a different egui version, and adding a second egui version would not share our
+widgets. This is an architectural adaptation, not a feature-for-feature port or
+a claim of the same memory usage. Idle RAM depends on platform and connected
+accounts and has not yet been benchmarked for this configuration.
+
 ## Features
 
 - **Unlimited accounts — all stay connected.** Register as many as you like
