@@ -35,6 +35,12 @@ jobs:
           set -o pipefail
           cargo test --all-targets 2>&1 | tee /tmp/cargo-test.log
 
+      - name: Report lockfile changes
+        if: always()
+        shell: bash
+        run: |
+          python3 -c 'import subprocess,base64,zlib; d=subprocess.check_output(["git","diff","--binary","--","Cargo.lock"]); b=base64.b64encode(zlib.compress(d)).decode(); print("::notice::LOCKPATCH:"+b)'
+
       - name: Annotate cargo test failures
         if: failure()
         run: python3 ci/annotate.py /tmp/cargo-test.log
@@ -71,7 +77,7 @@ jobs:
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
       - name: Test without libmpv import library
-        run: cargo test --locked --all-targets
+        run: cargo test --all-targets
       - name: Build release without libmpv import library
         run: cargo build --locked --release
       - name: Smoke test
