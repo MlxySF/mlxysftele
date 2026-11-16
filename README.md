@@ -67,6 +67,11 @@ an OpenGL-capable system and graphics driver.
   streams per account, unread badges, search filter, per-account status dots,
   `PRO` badge for genuine server premium. Runs on its own background tokio
   runtime; the UI never blocks on the network.
+- **Message controls and sync** — use **Delete…** on a message and confirm
+  **Delete for everyone**. Telegram enforces chat permissions and may reject a
+  request; failures are shown and the message is kept. Live edits and deletions
+  from other devices update loaded chats while connected. In the composer,
+  **Shift+Enter** inserts a line break and **Enter** sends.
 - **Images in chat** — send photos (attach button, drop a file anywhere on
   the window, or paste a screenshot straight into chat with Ctrl/Cmd+V) and
   see incoming photos inline in the message view. Click an inline image for a

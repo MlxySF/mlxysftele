@@ -52,11 +52,32 @@ impl Unread {
         }
     }
 
+    /// Forget a deleted newest message so a fresh server snapshot can replace
+    /// the old high watermark. Other unread counts are reconciled by refresh.
+    pub fn deleted_from_peer(&mut self, account: &str, peer: PeerId, ids: &[i32]) {
+        let key = (account.to_owned(), peer);
+        if let Some(state) = self.entries.get_mut(&key) {
+            if ids.contains(&state.newest) {
+                if state.count <= 1 { self.entries.remove(&key); }
+                else { state.count -= 1; state.newest = 0; }
+            }
+        }
+    }
+
+    pub fn deleted(&mut self, account: &str, channel: Option<PeerId>, ids: &[i32]) {
+        use grammers_session::types::PeerKind;
+        let peers: Vec<_> = self.entries.keys().filter(|(a, peer)| a == account && match channel {
+            Some(channel) => *peer == channel,
+            None => peer.kind() != PeerKind::Channel,
+        }).map(|(_, peer)| *peer).collect();
+        for peer in peers { self.deleted_from_peer(account, peer, ids); }
+    }
+
     pub fn count(&self, account: &str, peer: PeerId) -> u32 {
         self.entries.get(&(account.to_owned(), peer)).map_or(0, |s| s.count)
     }
     pub fn newest(&self, account: &str, peer: PeerId) -> Option<i32> {
-        self.entries.get(&(account.to_owned(), peer)).map(|s| s.newest)
+        self.entries.get(&(account.to_owned(), peer)).and_then(|s| (s.newest > 0).then_some(s.newest))
     }
     pub fn any(&self) -> bool { !self.entries.is_empty() }
     /// Keep all badges/counts, but alarm only for explicitly unmuted chats.

@@ -61,6 +61,7 @@ enum Cmd {
     RefreshDialogs { account: String },
     OpenChat { account: String, peer_id: PeerId },
     MarkRead { account: String, peer_id: PeerId, max_id: i32 },
+    DeleteMessage { account: String, peer_id: PeerId, msg_id: i32 },
     SendText { account: String, peer_id: PeerId, text: String },
     /// Send a local image file as a photo; `caption` may be empty.
     SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String },
@@ -123,11 +124,33 @@ fn upsert_chat_message(chat: &mut Vec<MsgItem>, msg: MsgItem) -> bool {
         return false;
     }
     chat.push(msg);
+    chat.sort_by_key(|message| message.id);
     if chat.len() > MAX_CACHED_MESSAGES {
         let excess = chat.len() - MAX_CACHED_MESSAGES;
         chat.drain(..excess);
     }
     true
+}
+
+/// Changes observed while a history request is in flight, replayed over the
+/// response so an older snapshot cannot undo a live update.
+#[derive(Clone)]
+enum HistoryChange {
+    New(MsgItem),
+    Edit(MsgItem),
+    Delete(Vec<i32>),
+}
+
+fn apply_history_change(chat: &mut Vec<MsgItem>, change: &HistoryChange) {
+    match change {
+        HistoryChange::New(msg) => { upsert_chat_message(chat, msg.clone()); }
+        HistoryChange::Edit(msg) => {
+            if let Some(old) = chat.iter_mut().find(|old| old.id == msg.id) {
+                *old = msg.clone();
+            }
+        }
+        HistoryChange::Delete(ids) => chat.retain(|msg| !ids.contains(&msg.id)),
+    }
 }
 
 /// Cache key used for an image attached to `msg_id` in `account`'s chat `peer_id`.
@@ -190,6 +213,11 @@ enum Evt {
     NotifyDefault { account: String, category: Category, result: Result<Option<i32>, String>, observed: Instant },
     History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
     Incoming { account: String, peer_id: PeerId, msg: MsgItem },
+    Edited { account: String, peer_id: PeerId, msg: MsgItem },
+    // Non-channel IDs are account-wide; Telegram does not include a peer.
+    Deleted { account: String, channel: Option<PeerId>, ids: Vec<i32> },
+    DeleteResult { account: String, peer_id: PeerId, msg_id: i32, result: Result<(), String> },
+    HistoryFailed { account: String, peer_id: PeerId, message: String },
     Sent {
         account: String,
         peer_id: PeerId,
@@ -590,6 +618,32 @@ impl Worker {
                             });
                             ctx.request_repaint();
                         }
+                        Ok(Update::MessageEdited(message)) => {
+                            let peer_id = message.peer_id();
+                            let media = split_media(&message);
+                            let msg = MsgItem {
+                                id: message.id(), outgoing: message.outgoing(),
+                                unix: message.date().timestamp(), text: message.text().to_string(),
+                                media: media.as_ref().map(|(kind, _, _)| kind.clone()),
+                            };
+                            if let Some((kind, Some(obj), size)) = media {
+                                let cache_key = media_cache_key(&account, peer_id, msg.id);
+                                match kind {
+                                    MsgMedia::Photo => spawn_media_download(&download_client, &data_dir,
+                                        &account, peer_id, msg.id, obj, size, &evt_tx, &ctx, MAX_MEDIA_BYTES),
+                                    MsgMedia::Video(_) => { let _ = evt_tx.send(Evt::StashMedia { cache_key, media: obj }); }
+                                    MsgMedia::Label(_) => {}
+                                }
+                            }
+                            let _ = evt_tx.send(Evt::Edited { account: account.clone(), peer_id, msg });
+                            ctx.request_repaint();
+                        }
+                        Ok(Update::MessageDeleted(deletion)) => {
+                            let channel = deletion.channel_id().map(PeerId::channel);
+                            let ids = deletion.into_messages();
+                            let _ = evt_tx.send(Evt::Deleted { account: account.clone(), channel, ids });
+                            ctx.request_repaint();
+                        }
                         Ok(Update::Raw(update)) => {
                             let read = match update.raw {
                                 tl::enums::Update::ReadHistoryInbox(ref r) if r.top_msg_id.is_none() =>
@@ -717,9 +771,12 @@ impl Worker {
     }
 
     async fn fetch_history(&mut self, account: &str, peer_id: PeerId) {
-        let Some(conn) = self.conns.get(account) else { return };
+        let Some(conn) = self.conns.get(account) else {
+            self.emit(Evt::HistoryFailed { account: account.into(), peer_id, message: "account is not connected".into() });
+            return;
+        };
         let Some(&peer_ref) = conn.peer_refs.get(&peer_id) else {
-            self.emit(Evt::Toast("chat not resolved yet — refresh the chat list".into()));
+            self.emit(Evt::HistoryFailed { account: account.into(), peer_id, message: "chat not resolved — refresh the chat list".into() });
             return;
         };
         let mut iter = conn.client.iter_messages(peer_ref).limit(HISTORY_PAGE);
@@ -730,7 +787,7 @@ impl Worker {
                 Ok(Some(message)) => message,
                 Ok(None) => break,
                 Err(e) => {
-                    self.emit(Evt::Toast(format!("history failed: {e}")));
+                    self.emit(Evt::HistoryFailed { account: account.into(), peer_id, message: e.to_string() });
                     return;
                 }
             };
@@ -799,6 +856,14 @@ impl Worker {
             }
         };
         self.emit(Evt::ReadResult { account: account.to_string(), peer_id, max_id, result });
+    }
+
+    async fn delete_message(&mut self, account: &str, peer_id: PeerId, msg_id: i32) {
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            Some((client, peer)) => client.delete_messages(peer, &[msg_id]).await.map(|_| ()).map_err(|e| e.to_string()),
+            None => Err("account or chat is not connected".into()),
+        };
+        self.emit(Evt::DeleteResult { account: account.into(), peer_id, msg_id, result });
     }
 
     async fn send_text(&mut self, account: &str, peer_id: PeerId, text: String) {
@@ -1178,6 +1243,7 @@ impl Worker {
                 Cmd::RefreshDialogs { account } => self.refresh_dialogs(&account).await,
                 Cmd::OpenChat { account, peer_id } => self.fetch_history(&account, peer_id).await,
                 Cmd::MarkRead { account, peer_id, max_id } => self.mark_read(&account, peer_id, max_id).await,
+                Cmd::DeleteMessage { account, peer_id, msg_id } => self.delete_message(&account, peer_id, msg_id).await,
                 Cmd::SendText { account, peer_id, text } => {
                     self.send_text(&account, peer_id, text).await
                 }
@@ -1323,6 +1389,9 @@ struct TelegramApp {
     filter: String,
     sel_peer: HashMap<String, PeerId>,
     chats: HashMap<(String, PeerId), Vec<MsgItem>>,
+    history_pending: HashMap<(String, PeerId), Vec<HistoryChange>>,
+    confirm_delete: Option<(String, PeerId, i32)>,
+    deleting: std::collections::HashSet<(String, PeerId, i32)>,
     unread: Unread,
     notifications: Notifications,
     notify_retry: HashMap<String, Instant>,
@@ -1376,6 +1445,9 @@ impl TelegramApp {
             filter: String::new(),
             sel_peer: HashMap::new(),
             chats: HashMap::new(),
+            history_pending: HashMap::new(),
+            confirm_delete: None,
+            deleting: std::collections::HashSet::new(),
             unread: Unread::default(),
             notifications: Notifications::default(),
             notify_retry: HashMap::new(),
@@ -1428,6 +1500,9 @@ impl TelegramApp {
                 self.sel_peer.retain(|k, _| known.contains(k));
                 self.last_auto_refresh.retain(|k, _| known.contains(k));
                 self.chats.retain(|(a, _), _| known.contains(a));
+                self.history_pending.retain(|(a, _), _| known.contains(a));
+                self.deleting.retain(|(a, _, _)| known.contains(a));
+                if self.confirm_delete.as_ref().is_some_and(|(a, _, _)| !known.contains(a)) { self.confirm_delete = None; }
                 self.unread.retain_accounts(&known);
                 self.notifications.retain_accounts(&known);
                 self.notify_retry.retain(|a, _| known.contains(a));
@@ -1500,20 +1575,25 @@ impl TelegramApp {
                     }
                 }
             }
-            Evt::History { account, peer_id, messages } => {
-                let entry = self.chats.entry((account, peer_id)).or_default();
-                *entry = messages;
-                if entry.len() > MAX_CACHED_MESSAGES {
-                    let excess = entry.len() - MAX_CACHED_MESSAGES;
-                    entry.drain(..excess);
+            Evt::History { account, peer_id, mut messages } => {
+                let key = (account, peer_id);
+                if let Some(changes) = self.history_pending.remove(&key) {
+                    for change in &changes { apply_history_change(&mut messages, change); }
                 }
+                if messages.len() > MAX_CACHED_MESSAGES {
+                    let excess = messages.len() - MAX_CACHED_MESSAGES;
+                    messages.drain(..excess);
+                }
+                self.chats.insert(key, messages);
+            }
+            Evt::HistoryFailed { account, peer_id, message } => {
+                self.history_pending.remove(&(account, peer_id));
+                self.toast = Some((format!("history failed: {message}"), Instant::now()));
             }
             Evt::Incoming { account, peer_id, msg } => {
                 let outgoing = msg.outgoing;
                 let message_id = msg.id;
-                if let Some(chat) = self.chats.get_mut(&(account.clone(), peer_id)) {
-                    upsert_chat_message(chat, msg);
-                }
+                self.record_chat_change(&account, peer_id, HistoryChange::New(msg));
                 // A history fetch can populate the message before its live
                 // update arrives. Deduplicate unread independently of the
                 // chat cache; the unread tracker has its own read watermark.
@@ -1538,6 +1618,34 @@ impl TelegramApp {
                     }
                 }
             }
+            Evt::Edited { account, peer_id, msg } => {
+                self.record_chat_change(&account, peer_id, HistoryChange::Edit(msg));
+                self.send_cmd(Cmd::RefreshDialogs { account });
+            }
+            Evt::Deleted { account, channel, ids } => {
+                use grammers_session::types::PeerKind;
+                // Ordinary message IDs share one account-wide namespace; channel
+                // message IDs are scoped to the channel, never to other peers.
+                let keys: std::collections::HashSet<_> = self.chats.keys().chain(self.history_pending.keys())
+                    .filter(|(a, peer)| a == &account && match channel {
+                        Some(channel) => *peer == channel,
+                        None => peer.kind() != PeerKind::Channel,
+                    }).cloned().collect();
+                for (_, peer) in keys { self.record_chat_change(&account, peer, HistoryChange::Delete(ids.clone())); }
+                self.unread.deleted(&account, channel, &ids);
+                self.send_cmd(Cmd::RefreshDialogs { account });
+            }
+            Evt::DeleteResult { account, peer_id, msg_id, result } => {
+                self.deleting.remove(&(account.clone(), peer_id, msg_id));
+                match result {
+                    Ok(()) => {
+                        self.record_chat_change(&account, peer_id, HistoryChange::Delete(vec![msg_id]));
+                        self.unread.deleted_from_peer(&account, peer_id, &[msg_id]);
+                        self.send_cmd(Cmd::RefreshDialogs { account });
+                    }
+                    Err(e) => self.toast = Some((format!("Could not delete for everyone: {e}"), Instant::now())),
+                }
+            }
             Evt::Sent { account, peer_id, result, source_path } => match result {
                 Ok(msg) => {
                     // A photo we just sent: cache the local file for rendering.
@@ -1549,9 +1657,7 @@ impl TelegramApp {
                             self.pending_attachment = None;
                         }
                     }
-                    if let Some(chat) = self.chats.get_mut(&(account.clone(), peer_id)) {
-                        upsert_chat_message(chat, msg);
-                    }
+                    self.record_chat_change(&account, peer_id, HistoryChange::New(msg));
                     // If the chat was not open the user will re-fetch history on next open.
                 }
                 Err(e) => self.toast = Some((format!("send failed: {e}"), Instant::now())),
@@ -1648,6 +1754,22 @@ impl TelegramApp {
         }
     }
 
+    fn record_chat_change(&mut self, account: &str, peer_id: PeerId, change: HistoryChange) {
+        let key = (account.to_owned(), peer_id);
+        if let Some(chat) = self.chats.get_mut(&key) { apply_history_change(chat, &change); }
+        if let Some(changes) = self.history_pending.get_mut(&key) { changes.push(change); }
+    }
+
+    fn request_history(&mut self, account: String, peer_id: PeerId) {
+        let key = (account.clone(), peer_id);
+        if self.history_pending.contains_key(&key) { return; }
+        self.history_pending.insert(key.clone(), Vec::new());
+        if self.cmd_tx.send(Cmd::OpenChat { account, peer_id }).is_err() {
+            self.history_pending.remove(&key);
+            self.toast = Some(("history failed: worker stopped".into(), Instant::now()));
+        }
+    }
+
     fn send_cmd(&self, cmd: Cmd) {
         let _ = self.cmd_tx.send(cmd);
     }
@@ -1721,7 +1843,7 @@ impl TelegramApp {
             self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
             self.pending_attachment = None;
             if !self.chats.contains_key(&(account.clone(), peer_id)) {
-                self.send_cmd(Cmd::OpenChat { account, peer_id });
+                self.request_history(account, peer_id);
             }
         }
     }
@@ -1877,7 +1999,9 @@ impl eframe::App for TelegramApp {
         // ESC closes the top-most thing: viewer → picker → settings/add → chat.
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if esc {
-            if self.viewer.take().is_some() {
+            if self.confirm_delete.take().is_some() {
+                // deletion cancelled
+            } else if self.viewer.take().is_some() {
                 // viewer closed
             } else if self.video.take().is_some() {
                 // video player closed
@@ -1951,6 +2075,7 @@ impl eframe::App for TelegramApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
+        self.ui_delete_confirmation(ui.ctx());
         self.ui_settings_window(ui.ctx());
         self.ui_add_window(ui.ctx());
         self.ui_picker_window(ui.ctx());
@@ -1965,7 +2090,7 @@ impl TelegramApp {
     /// visible window. Do not mark a hidden account/chat or an overlaid chat read.
     fn mark_visible_chat_read(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.focused && i.viewport().visible() != Some(false))
-            || self.show_settings || self.show_add || self.show_picker || self.viewer.is_some() || self.video.is_some() {
+            || self.show_settings || self.show_add || self.show_picker || self.viewer.is_some() || self.video.is_some() || self.confirm_delete.is_some() {
             return;
         }
         let Some(account) = self.sel_account.clone() else { return };
@@ -1982,7 +2107,7 @@ impl TelegramApp {
         }
         self.last_read_attempt.insert(key.clone(), Instant::now());
         if !history_is_current {
-            self.send_cmd(Cmd::OpenChat { account, peer_id });
+            self.request_history(account, peer_id);
             return;
         }
         self.pending_reads.insert(key, max_id);
@@ -2276,7 +2401,7 @@ impl TelegramApp {
         // Composer docked at the bottom; history fills the middle.
         egui::Panel::bottom("composer_dock")
             .show_separator_line(false)
-            .exact_size(if has_attachment { 96.0 } else { 58.0 })
+            .exact_size(if has_attachment { 128.0 } else { 90.0 })
             .show(ui, |ui| {
                 if self.pending_attachment.is_some() {
                     ui.add_space(4.0);
@@ -2310,14 +2435,26 @@ impl TelegramApp {
                     {
                         self.open_picker();
                     }
+                    // Consume plain Enter before TextEdit sees it; Shift+Enter
+                    // remains available to insert a newline at the cursor.
+                    let enter = ui.memory(|m| m.has_focus(composer_id())) && ui.input_mut(|i| {
+                        let mut found = false;
+                        i.events.retain(|event| {
+                            let plain = matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
+                                if modifiers.matches_exact(egui::Modifiers::NONE));
+                            found |= plain;
+                            !plain
+                        });
+                        found
+                    });
                     let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.composer)
+                        egui::TextEdit::multiline(&mut self.composer)
+                            .desired_rows(3)
+                            .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
                             .id(composer_id())
-                            .hint_text(format!("Message {peer_name}…"))
+                            .hint_text(format!("Message {peer_name}… (Shift+Enter for a new line)"))
                             .desired_width(ui.available_width() - 178.0),
                     );
-                    let enter = response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let can_send = !self.composer.trim().is_empty() || self.pending_attachment.is_some();
                     let send_clicked = ui
                         .add_enabled(
@@ -2326,7 +2463,7 @@ impl TelegramApp {
                                 .fill(egui::Color32::from_rgb(46, 122, 214)),
                         )
                         .clicked();
-                    if enter || send_clicked {
+                    if (enter && can_send) || send_clicked {
                         response.request_focus();
                         let text = self.composer.trim().to_string();
                         let attachment = self.pending_attachment.take();
@@ -2486,11 +2623,14 @@ impl TelegramApp {
                         let color = if outgoing { egui::Color32::WHITE } else { text_color };
                         ui.label(egui::RichText::new(&message.text).color(color).size(13.5));
                     }
-                    ui.label(
-                        egui::RichText::new(format_msg_time(message.unix))
-                            .small()
-                            .color(time_color),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format_msg_time(message.unix)).small().color(time_color));
+                        let pending = self.deleting.contains(&(account.to_owned(), peer_id, message.id));
+                        if ui.add_enabled(!pending, egui::Button::new("Delete…").small())
+                            .on_hover_text("Delete this message for everyone").clicked() {
+                            self.confirm_delete = Some((account.to_owned(), peer_id, message.id));
+                        }
+                    });
                 });
             });
         if let Some(viewer) = open_viewer {
@@ -2499,6 +2639,29 @@ impl TelegramApp {
         if let Some((account, peer_id, msg_id)) = open_video {
             self.send_cmd(Cmd::OpenVideo { account, peer_id, msg_id });
         }
+    }
+
+    fn ui_delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some((account, peer_id, msg_id)) = self.confirm_delete.clone() else { return };
+        egui::Window::new("Delete message?")
+            .collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Delete this message for everyone? This cannot be undone.");
+                ui.label(egui::RichText::new("Telegram may reject this if you don't have permission.").weak().small());
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() { self.confirm_delete = None; }
+                    if ui.button("Delete for everyone").clicked() {
+                        self.confirm_delete = None;
+                        let key = (account.clone(), peer_id, msg_id);
+                        if self.cmd_tx.send(Cmd::DeleteMessage { account: account.clone(), peer_id, msg_id }).is_ok() {
+                            self.deleting.insert(key);
+                        } else {
+                            self.toast = Some(("Could not delete: worker stopped".into(), Instant::now()));
+                        }
+                    }
+                });
+            });
     }
 
     /// Write a pasted clipboard image to `<data_dir>/cache/paste/` and stage it.
@@ -3258,6 +3421,80 @@ mod message_cache_tests {
 
     fn photo(id: i32, text: &str) -> MsgItem {
         MsgItem { id, outgoing: true, unix: 1, text: text.into(), media: Some(MsgMedia::Photo) }
+    }
+
+    #[test]
+    fn edits_deletes_and_inflight_history_respect_account_and_channel_scope() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let user = PeerId::user(1);
+        let channel = PeerId::channel(2);
+        let other_channel = PeerId::channel(3);
+        app.chats.insert(("a".into(), channel), vec![photo(10, "channel")]);
+        app.chats.insert(("a".into(), other_channel), vec![photo(10, "other channel")]);
+        app.chats.insert(("b".into(), user), vec![photo(10, "other account")]);
+        app.request_history("a".into(), user);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        app.apply_event(Evt::Edited { account: "a".into(), peer_id: user, msg: photo(10, "edited") });
+        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: user, msg: photo(11, "new") });
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: None, ids: vec![11] });
+        app.apply_event(Evt::History { account: "a".into(), peer_id: user, messages: vec![photo(10, "old"), photo(11, "deleted")] });
+        assert_eq!(app.chats[&(String::from("a"), user)].len(), 1);
+        assert_eq!(app.chats[&(String::from("a"), user)][0].text, "edited");
+        assert_eq!(app.chats[&(String::from("b"), user)].len(), 1);
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: Some(channel), ids: vec![10] });
+        assert!(app.chats[&(String::from("a"), channel)].is_empty());
+        assert_eq!(app.chats[&(String::from("a"), other_channel)].len(), 1);
+        assert_eq!(app.chats[&(String::from("a"), user)].len(), 1);
+    }
+
+    #[test]
+    fn delete_result_only_removes_on_success_and_history_failure_can_retry() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let key = ("a".to_string(), peer);
+        app.chats.insert(key.clone(), vec![photo(5, "kept")]);
+        app.deleting.insert(("a".into(), peer, 5));
+        app.apply_event(Evt::DeleteResult { account: "a".into(), peer_id: peer, msg_id: 5, result: Err("not allowed".into()) });
+        assert_eq!(app.chats[&key].len(), 1);
+        assert!(!app.deleting.contains(&("a".into(), peer, 5)));
+        assert!(app.toast.as_ref().unwrap().0.contains("not allowed"));
+        app.request_history("a".into(), peer);
+        app.request_history("a".into(), peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        assert!(cmd_rx.try_recv().is_err());
+        app.apply_event(Evt::DeleteResult { account: "a".into(), peer_id: peer, msg_id: 5, result: Ok(()) });
+        app.apply_event(Evt::History { account: "a".into(), peer_id: peer, messages: vec![photo(5, "stale")] });
+        assert!(app.chats[&key].is_empty());
+        while cmd_rx.try_recv().is_ok() {}
+        app.request_history("a".into(), peer);
+        app.apply_event(Evt::HistoryFailed { account: "a".into(), peer_id: peer, message: "offline".into() });
+        app.request_history("a".into(), peer);
+        assert!(app.history_pending.contains_key(&key));
+    }
+
+    #[test]
+    fn composer_shift_enter_adds_line_and_enter_sends() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        app.sel_account = Some("a".into());
+        app.sel_peer.insert("a".into(), PeerId::user(1));
+        app.composer = "hello".into();
+        ctx.memory_mut(|m| m.request_focus(composer_id()));
+        let event = |modifiers| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers };
+        ctx.run_ui(egui::RawInput { focused: true, ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput { focused: true, modifiers: egui::Modifiers::SHIFT, events: vec![event(egui::Modifiers::SHIFT)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        assert!(app.composer.contains('\n'));
+        assert!(cmd_rx.try_recv().is_err());
+        app.composer.push_str("world");
+        ctx.run_ui(egui::RawInput { focused: true, events: vec![event(egui::Modifiers::NONE)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SendText { text, .. }) if text.contains('\n') && text.contains("world")));
+        assert!(app.composer.is_empty());
     }
 
     #[test]
