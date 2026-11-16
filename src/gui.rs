@@ -3515,11 +3515,11 @@ mod message_cache_tests {
         ctx.memory_mut(|m| m.request_focus(composer_id()));
         let event = |modifiers| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers };
         ctx.run_ui(egui::RawInput { focused: true, ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
-        ctx.run_ui(egui::RawInput { focused: true, modifiers: egui::Modifiers::SHIFT, events: vec![event(egui::Modifiers::SHIFT)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput { focused: true, events: vec![egui::Event::ModifiersChanged(egui::Modifiers::SHIFT), event(egui::Modifiers::SHIFT)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
         assert!(app.composer.contains('\n'));
         assert!(cmd_rx.try_recv().is_err());
         app.composer.push_str("world");
-        ctx.run_ui(egui::RawInput { focused: true, events: vec![event(egui::Modifiers::NONE)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput { focused: true, events: vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE), event(egui::Modifiers::NONE)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
         assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SendText { text, .. }) if text.contains('\n') && text.contains("world")));
         assert!(app.composer.is_empty());
     }
