@@ -59,6 +59,11 @@ impl Unread {
         self.entries.get(&(account.to_owned(), peer)).map(|s| s.newest)
     }
     pub fn any(&self) -> bool { !self.entries.is_empty() }
+    /// Keep all badges/counts, but alarm only for explicitly unmuted chats.
+    pub fn any_alertable(&self, notifications: &crate::notifications::Notifications, now: u64) -> bool {
+        self.entries.keys().any(|(account, peer)|
+            notifications.status(account, *peer, now) == crate::notifications::MuteStatus::Unmuted)
+    }
     pub fn retain_accounts(&mut self, known: &std::collections::HashSet<String>) {
         self.entries.retain(|(a, _), _| known.contains(a));
         self.read_through.retain(|(a, _), _| known.contains(a));
@@ -84,6 +89,31 @@ mod tests {
         u.snapshot("a", p, 3, 20, 10); // delayed stale server snapshot
         assert!(!u.any());
     }
+    #[test]
+    fn muted_unread_is_counted_but_does_not_sound_alarm() {
+        use crate::notifications::{Category, Notifications};
+        use std::time::{Duration, Instant};
+        let p = PeerId::user(1); let q = PeerId::user(2);
+        let t = Instant::now(); let mut u = Unread::default(); let mut settings = Notifications::default();
+        u.incoming("a", p, 1);
+        settings.set_category("a", p, Category::User);
+        settings.set_peer("a", p, Some(500), t);
+        assert_eq!(u.count("a", p), 1);
+        assert!(!u.any_alertable(&settings, 100));
+        u.incoming("a", q, 2);
+        assert!(!u.any_alertable(&settings, 100)); // unknown is not assumed unmuted
+        settings.set_category("a", q, Category::User);
+        settings.set_peer("a", q, Some(0), t);
+        assert!(u.any_alertable(&settings, 100));
+        u.read("a", q, 2, Some(0));
+        assert!(!u.any_alertable(&settings, 100));
+        assert!(u.any_alertable(&settings, 500)); // timed mute expired
+        settings.set_peer("a", p, Some(0), t + Duration::from_secs(1));
+        assert!(u.any_alertable(&settings, 100)); // live unmute wakes the alarm
+        settings.set_peer("a", p, Some(i32::MAX), t + Duration::from_secs(2));
+        assert!(!u.any_alertable(&settings, 100));
+    }
+
     #[test]
     fn old_ack_cannot_clear_newer_incoming_or_snapshot() {
         let p = PeerId::user(1); let mut u = Unread::default();

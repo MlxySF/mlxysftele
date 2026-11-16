@@ -85,14 +85,18 @@ an OpenGL-capable system and graphics driver.
   at runtime, so the application builds and runs without it; playback requires
   installing the shared library as described below. Video files land in
   `<data_dir>/cache/media/` like photos.
-- **Repeated unread alarm** — a short alert repeats every five seconds while
-  any connected account has unread messages, including while the window is
-  minimized. It stops when all are read here or on another Telegram device.
-  Opening a chat in the focused, visible window marks the loaded messages read
-  on Telegram; a failed read request leaves the alert active and is retried.
-  Audio requires a working default output device and system volume; if opening
-  the device fails, the app displays an error and retries. The app must remain
-  running and connected; unread counts are loaded from Telegram at startup.
+- **Repeated unread alarm** — three loud beeps repeat every 1.5 seconds while
+  an unmuted chat has unread messages, including while the window is minimized.
+  Muted chats retain their unread counts in grey but do not trigger the alarm.
+  Telegram's per-chat and account-wide mute settings are used; timed mutes expire
+  automatically. Unknown settings show “checking…” and do not sound until loaded;
+  failed sync is displayed and retried. Individual forum-topic overrides are not
+  yet supported. The alarm stops when all unmuted messages are read here or on
+  another Telegram device. Opening a chat in the focused, visible window marks
+  the loaded messages read on Telegram; failed read requests are retried.
+  Audio requires a working default output device and system volume. The app must
+  stay running, connected, and the computer must stay awake; this is not a
+  substitute for a dedicated alarm or a guaranteed wake-up system.
 - **Keyboard flow** — Esc closes, in order: the image viewer, the video
   player, the file picker, Settings, the add-account window, and finally the
   open chat (back to "pick a chat").

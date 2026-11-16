@@ -3,9 +3,13 @@
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{OutputStream, OutputStreamBuilder, Sink};
 
-const REPEAT: Duration = Duration::from_secs(5);
+// Three 240ms beeps, separated by 120ms gaps; repeat every 1.5 seconds.
+const REPEAT: Duration = Duration::from_millis(1500);
+const SAMPLE_RATE: usize = 48_000;
+const BEEP_SAMPLES: usize = SAMPLE_RATE * 240 / 1000;
+const GAP_SAMPLES: usize = SAMPLE_RATE * 120 / 1000;
 
 pub struct Alarm {
     tx: Sender<bool>,
@@ -51,11 +55,26 @@ impl AudioOutput {
 impl Beeper for AudioOutput {
     fn beep(&mut self) {
         if self.sink.empty() {
-            self.sink.append(rodio::source::SineWave::new(880.0)
-                .take_duration(Duration::from_millis(300)).amplify(0.18));
+            self.sink.append(rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE as u32, alarm_samples()));
         }
     }
     fn stop(&mut self) { self.sink.stop(); }
+}
+
+/// A loud but unclipped 880 Hz three-beep sequence with short fades to avoid
+/// clicks. The OS/device volume still controls the actual output loudness.
+fn alarm_samples() -> Vec<f32> {
+    let mut samples = Vec::with_capacity(3 * BEEP_SAMPLES + 2 * GAP_SAMPLES);
+    let fade = SAMPLE_RATE / 200; // 5 ms
+    for beep in 0..3 {
+        for i in 0..BEEP_SAMPLES {
+            let envelope = (i as f32 / fade as f32).min((BEEP_SAMPLES - 1 - i) as f32 / fade as f32).min(1.0);
+            let phase = 2.0 * std::f32::consts::PI * 880.0 * i as f32 / SAMPLE_RATE as f32;
+            samples.push(0.85 * envelope * phase.sin());
+        }
+        if beep < 2 { samples.resize(samples.len() + GAP_SAMPLES, 0.0); }
+    }
+    samples
 }
 
 fn run<B: Beeper>(
@@ -110,6 +129,21 @@ mod tests {
         fn beep(&mut self) { self.0.send("beep").unwrap(); }
         fn stop(&mut self) { self.0.send("stop").unwrap(); }
     }
+    #[test]
+    fn pattern_has_three_loud_beeps_and_two_silent_gaps() {
+        let samples = alarm_samples();
+        assert_eq!(samples.len(), 3 * BEEP_SAMPLES + 2 * GAP_SAMPLES);
+        for i in 0..3 {
+            let start = i * (BEEP_SAMPLES + GAP_SAMPLES);
+            let peak = samples[start..start + BEEP_SAMPLES].iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+            assert!(peak > 0.8 && peak <= 0.85);
+            if i < 2 {
+                assert!(samples[start + BEEP_SAMPLES..start + BEEP_SAMPLES + GAP_SAMPLES].iter().all(|s| *s == 0.0));
+            }
+        }
+        assert!(REPEAT > Duration::from_millis(3 * 240 + 2 * 120));
+    }
+
     #[test]
     fn repeats_until_stopped_and_starts_again() {
         let (tx, rx) = mpsc::channel();

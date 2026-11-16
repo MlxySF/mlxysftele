@@ -17,6 +17,7 @@ mod daemon;
 mod gui;
 mod log;
 mod lowmem;
+mod notifications;
 mod premium;
 mod telegram;
 mod unread;

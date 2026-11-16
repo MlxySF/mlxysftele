@@ -37,6 +37,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::alarm::Alarm;
 use crate::unread::Unread;
+use crate::notifications::{Category, MuteStatus, Notifications};
 use crate::config::{AccountMeta, Config};
 use crate::premium::{self, PremiumToggles};
 use crate::telegram;
@@ -86,6 +87,8 @@ struct DialogItem {
     unread_count: u32,
     top_message: i32,
     read_inbox_max_id: i32,
+    category: Category,
+    mute_until: Option<i32>,
 }
 
 /// Media carried by a chat message.
@@ -131,6 +134,12 @@ fn media_cache_key(account: &str, peer_id: PeerId, msg_id: i32) -> String {
     format!("{account}_{}_{msg_id}", peer_id)
 }
 
+/// The Telegram peer-specific mute is optional: absent means inherit the
+/// account-wide user/group/broadcast setting rather than unmuted.
+fn notification_mute_until(settings: &tl::enums::PeerNotifySettings) -> Option<i32> {
+    match settings { tl::enums::PeerNotifySettings::Settings(settings) => settings.mute_until }
+}
+
 /// Don't auto-download anything larger than this.
 const MAX_MEDIA_BYTES: u64 = 24 * 1024 * 1024;
 
@@ -172,7 +181,10 @@ enum Evt {
     Config(Config),
     Status { name: String, status: ConnStatus },
     Me { name: String, me: MeInfo },
-    Dialogs { name: String, items: Vec<DialogItem> },
+    Dialogs { name: String, items: Vec<DialogItem>, observed: Instant },
+    NotifyPeer { account: String, peer_id: PeerId, until: Option<i32>, observed: Instant },
+    NotifySyncError { account: String, message: String },
+    NotifyDefault { account: String, category: Category, result: Result<Option<i32>, String>, observed: Instant },
     History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
     Incoming { account: String, peer_id: PeerId, msg: MsgItem },
     Sent {
@@ -587,6 +599,26 @@ impl Worker {
                                 let _ = evt_tx.send(Evt::ReadUpdate { account: account.clone(), peer_id, max_id, remaining });
                                 ctx.request_repaint();
                             }
+                            if let tl::enums::Update::NotifySettings(ref notification) = update.raw {
+                                let until = notification_mute_until(&notification.notify_settings);
+                                let observed = Instant::now();
+                                let event = match &notification.peer {
+                                    tl::enums::NotifyPeer::Peer(peer) => Some(Evt::NotifyPeer {
+                                        account: account.clone(), peer_id: peer.peer.clone().into(), until, observed,
+                                    }),
+                                    tl::enums::NotifyPeer::NotifyUsers => Some(Evt::NotifyDefault {
+                                        account: account.clone(), category: Category::User, result: Ok(until), observed,
+                                    }),
+                                    tl::enums::NotifyPeer::NotifyChats => Some(Evt::NotifyDefault {
+                                        account: account.clone(), category: Category::Group, result: Ok(until), observed,
+                                    }),
+                                    tl::enums::NotifyPeer::NotifyBroadcasts => Some(Evt::NotifyDefault {
+                                        account: account.clone(), category: Category::Broadcast, result: Ok(until), observed,
+                                    }),
+                                    _ => None, // individual forum topics need topic-level unread state
+                                };
+                                if let Some(event) = event { let _ = evt_tx.send(event); ctx.request_repaint(); }
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -611,12 +643,31 @@ impl Worker {
     }
 
     async fn refresh_dialogs(&mut self, name: &str) {
+        let Some(client) = self.conns.get(name).map(|conn| conn.client.clone()) else { return };
+        // Per-chat settings can inherit one of these three account defaults.
+        for (category, peer) in [
+            (Category::User, tl::enums::InputNotifyPeer::InputNotifyUsers),
+            (Category::Group, tl::enums::InputNotifyPeer::InputNotifyChats),
+            (Category::Broadcast, tl::enums::InputNotifyPeer::InputNotifyBroadcasts),
+        ] {
+            let observed = Instant::now();
+            let result = client.invoke(&tl::functions::account::GetNotifySettings { peer }).await
+                .map(|settings| notification_mute_until(&settings)).map_err(|e| e.to_string());
+            self.emit(Evt::NotifyDefault { account: name.to_owned(), category, result, observed });
+        }
+        let observed = Instant::now();
         let Some(conn) = self.conns.get_mut(name) else { return };
         // Fetch every dialog so an unread chat beyond an arbitrary UI limit
         // can still trigger the alarm at startup.
         let mut iter = conn.client.iter_dialogs();
         let mut items = Vec::new();
-        while let Ok(Some(dialog)) = iter.next().await {
+        let mut dialog_error = None;
+        loop {
+            let dialog = match iter.next().await {
+                Ok(Some(dialog)) => dialog,
+                Ok(None) => break,
+                Err(error) => { dialog_error = Some(error.to_string()); break; }
+            };
             let peer_id = dialog.peer_id();
             let peer_ref = dialog.peer_ref();
             conn.peer_refs.insert(peer_id, peer_ref);
@@ -632,9 +683,14 @@ impl Worker {
                 let p = p.trim().to_string();
                 if p.is_empty() { None } else { Some(truncate(&p, 80)) }
             });
-            let (unread_count, top_message, read_inbox_max_id) = match &dialog.raw {
-                tl::enums::Dialog::Dialog(raw) => (raw.unread_count.max(0) as u32, raw.top_message, raw.read_inbox_max_id),
+            let (unread_count, top_message, read_inbox_max_id, mute_until) = match &dialog.raw {
+                tl::enums::Dialog::Dialog(raw) => (raw.unread_count.max(0) as u32, raw.top_message, raw.read_inbox_max_id, notification_mute_until(&raw.notify_settings)),
                 _ => continue,
+            };
+            let category = match dialog.peer() {
+                grammers_client::peer::Peer::User(_) => Category::User,
+                grammers_client::peer::Peer::Group(_) => Category::Group,
+                grammers_client::peer::Peer::Channel(_) => Category::Broadcast,
             };
             items.push(DialogItem {
                 peer_id,
@@ -643,9 +699,14 @@ impl Worker {
                 unread_count,
                 top_message,
                 read_inbox_max_id,
+                category,
+                mute_until,
             });
         }
-        self.emit(Evt::Dialogs { name: name.to_string(), items });
+        self.emit(Evt::Dialogs { name: name.to_string(), items, observed });
+        if let Some(message) = dialog_error {
+            self.emit(Evt::NotifySyncError { account: name.to_owned(), message });
+        }
     }
 
     async fn fetch_history(&mut self, account: &str, peer_id: PeerId) {
@@ -1247,6 +1308,8 @@ struct TelegramApp {
     sel_peer: HashMap<String, PeerId>,
     chats: HashMap<(String, PeerId), Vec<MsgItem>>,
     unread: Unread,
+    notifications: Notifications,
+    notify_retry: HashMap<String, Instant>,
     pending_reads: HashMap<(String, PeerId), i32>,
     last_read_attempt: HashMap<(String, PeerId), Instant>,
     alarm: Alarm,
@@ -1293,6 +1356,8 @@ impl TelegramApp {
             sel_peer: HashMap::new(),
             chats: HashMap::new(),
             unread: Unread::default(),
+            notifications: Notifications::default(),
+            notify_retry: HashMap::new(),
             pending_reads: HashMap::new(),
             last_read_attempt: HashMap::new(),
             alarm,
@@ -1339,6 +1404,8 @@ impl TelegramApp {
                 self.last_auto_refresh.retain(|k, _| known.contains(k));
                 self.chats.retain(|(a, _), _| known.contains(a));
                 self.unread.retain_accounts(&known);
+                self.notifications.retain_accounts(&known);
+                self.notify_retry.retain(|a, _| known.contains(a));
                 self.pending_reads.retain(|(a, _), _| known.contains(a));
                 self.last_read_attempt.retain(|(a, _), _| known.contains(a));
                 if let Some(sel) = &self.sel_account {
@@ -1357,11 +1424,32 @@ impl TelegramApp {
             Evt::Me { name, me } => {
                 self.me.insert(name, me);
             }
-            Evt::Dialogs { name, items } => {
+            Evt::Dialogs { name, items, observed } => {
                 for dialog in &items {
                     self.unread.snapshot(&name, dialog.peer_id, dialog.unread_count, dialog.top_message, dialog.read_inbox_max_id);
+                    self.notifications.set_category(&name, dialog.peer_id, dialog.category);
+                    self.notifications.set_peer(&name, dialog.peer_id, dialog.mute_until, observed);
                 }
                 self.dialogs.insert(name, items);
+            }
+            Evt::NotifyPeer { account, peer_id, until, observed } => {
+                self.notifications.set_peer(&account, peer_id, until, observed);
+            }
+            Evt::NotifySyncError { account, message } => {
+                self.notify_retry.insert(account, Instant::now() + Duration::from_secs(30));
+                self.toast = Some((format!("Could not load chats; alarm may be delayed: {message}"), Instant::now()));
+            }
+            Evt::NotifyDefault { account, category, result, observed } => {
+                match result {
+                    Ok(until) => {
+                        self.notifications.set_default(&account, category, until, observed);
+                        if self.notifications.all_defaults_known(&account) { self.notify_retry.remove(&account); }
+                    }
+                    Err(error) => {
+                        self.notify_retry.insert(account, Instant::now() + Duration::from_secs(30));
+                        self.toast = Some((format!("Could not load notification settings; alarm may be delayed: {error}"), Instant::now()));
+                    }
+                }
             }
             Evt::History { account, peer_id, messages } => {
                 let entry = self.chats.entry((account, peer_id)).or_default();
@@ -1388,7 +1476,7 @@ impl TelegramApp {
                     .dialogs
                     .get(&account)
                     .map(|d| d.iter().any(|d| d.peer_id == peer_id))
-                    .unwrap_or(true);
+                    .unwrap_or(false);
                 if !known {
                     let stale = self
                         .last_auto_refresh
@@ -1695,7 +1783,17 @@ impl eframe::App for TelegramApp {
             self.toast = Some((error, Instant::now()));
         }
         self.mark_visible_chat_read(ctx);
-        self.alarm.set_active(self.unread.any());
+        let now = util::now_unix();
+        self.alarm.set_active(self.unread.any_alertable(&self.notifications, now));
+        if let Some(expiry) = self.notifications.next_expiry(now) {
+            ctx.request_repaint_after(Duration::from_secs((expiry - now).clamp(1, 3600)));
+        }
+        let retry_accounts: Vec<_> = self.notify_retry.iter().filter(|(_, at)| **at <= Instant::now()).map(|(name, _)| name.clone()).collect();
+        for account in retry_accounts {
+            self.notify_retry.insert(account.clone(), Instant::now() + Duration::from_secs(30));
+            self.send_cmd(Cmd::RefreshDialogs { account });
+        }
+        if !self.notify_retry.is_empty() { ctx.request_repaint_after(Duration::from_secs(30)); }
         if let Some((_, since)) = &self.toast {
             if since.elapsed() > Duration::from_secs(6) {
                 self.toast = None;
@@ -1854,6 +1952,10 @@ impl TelegramApp {
                                 .strong(),
                         )
                         .on_hover_text("all registered accounts stay connected while mlxysftele runs");
+                        if !self.notify_retry.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(255, 176, 46), "Notification sync failed — retrying")
+                                .on_hover_text("Unknown notification settings are not alarmed until they load.");
+                        }
                         if self.cfg.local_premium.enabled {
                             ui.label(egui::RichText::new("Local premium").weak().small())
                                 .on_hover_text(
@@ -1986,6 +2088,7 @@ impl TelegramApp {
                 }
                 let selected = self.sel_peer.get(&account) == Some(&dialog.peer_id);
                 let unread = self.unread.count(&account, dialog.peer_id);
+                let mute = self.notifications.status(&account, dialog.peer_id, util::now_unix());
                 let name = dialog.name.clone();
                 let preview = dialog.preview.clone();
                 let text = ui.visuals().text_color();
@@ -2009,6 +2112,14 @@ impl TelegramApp {
                         egui::FontId::proportional(10.5),
                         egui::Color32::from_gray(145),
                     );
+                    if mute != MuteStatus::Unmuted {
+                        p.text(
+                            egui::pos2(rect.right() - 10.0, rect.center().y - 11.0),
+                            egui::Align2::RIGHT_CENTER,
+                            if mute == MuteStatus::Muted { "muted" } else { "checking…" },
+                            egui::FontId::proportional(10.0), egui::Color32::from_gray(150),
+                        );
+                    }
                     if unread > 0 {
                         let digits = format!("{}", unread.min(99));
                         let w = 12.0 + 7.0 * digits.len() as f32;
@@ -2016,7 +2127,8 @@ impl TelegramApp {
                             egui::pos2(rect.right() - w / 2.0 - 10.0, rect.center().y),
                             egui::vec2(w, 17.0),
                         );
-                        p.rect_filled(pill, 8.5, egui::Color32::from_rgb(255, 95, 86));
+                        let color = if mute == MuteStatus::Unmuted { egui::Color32::from_rgb(255, 95, 86) } else { egui::Color32::from_gray(105) };
+                        p.rect_filled(pill, 8.5, color);
                         p.text(
                             pill.center(),
                             egui::Align2::CENTER_CENTER,
