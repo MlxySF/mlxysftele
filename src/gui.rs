@@ -3058,7 +3058,7 @@ impl TelegramApp {
                     }
                     // Consume plain Enter before TextEdit sees it; Shift+Enter
                     // remains available to insert a newline at the cursor.
-                    let enter = ui.memory(|m| m.has_focus(composer_id())) && ui.input_mut(|i| {
+                    let enter = self.edit_draft.is_none() && ui.memory(|m| m.has_focus(composer_id())) && ui.input_mut(|i| {
                         let mut found = false;
                         i.events.retain(|event| {
                             let plain = matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
@@ -3294,6 +3294,7 @@ impl TelegramApp {
                             self.edit_draft = Some(EditDraft { account: account.to_owned(), peer_id, msg_id: message.id,
                                 text: message.text.clone(), original: message.text.clone(), caption: message.media.is_some(),
                                 request_id: None, error: None, changed_remotely: false });
+                            self.ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("edit_message_text")));
                         }
                         if ui.small_button("Reply").clicked() {
                             self.reply_draft = Some(ReplyDraft { account: account.to_owned(), peer_id, msg_id: message.id, preview: preview_text(message) });
@@ -3358,7 +3359,7 @@ impl TelegramApp {
                 ui.label(format!("Account: {}", draft.account));
                 ui.label(egui::RichText::new("Editing sends plain text; existing formatting will be removed. Telegram may reject edits due to permissions or time limits.").weak().small());
                 if draft.changed_remotely { ui.colored_label(egui::Color32::YELLOW, "This message changed on another device. Saving will overwrite that edit."); }
-                ui.add_enabled(draft.request_id.is_none(), egui::TextEdit::multiline(&mut draft.text).desired_rows(5).desired_width(f32::INFINITY));
+                ui.add_enabled(draft.request_id.is_none(), egui::TextEdit::multiline(&mut draft.text).id(egui::Id::new("edit_message_text")).desired_rows(5).desired_width(f32::INFINITY));
                 if let Some(error) = &draft.error { ui.colored_label(egui::Color32::LIGHT_RED, format!("Edit failed: {error}")); }
                 ui.horizontal(|ui| {
                     if ui.add_enabled(draft.request_id.is_none(), egui::Button::new("Cancel")).clicked() { close = true; }
