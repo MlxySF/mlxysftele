@@ -2441,9 +2441,15 @@ impl TelegramApp {
                         egui::FontId::proportional(11.0),
                         egui::Color32::from_gray(150),
                     );
-                    if refresh_failed {
+                    let warning = match &status {
+                        ConnStatus::Error(_) => Some(("offline", egui::Color32::from_rgb(255, 95, 86))),
+                        ConnStatus::Unauthorized => Some(("sign in", egui::Color32::from_rgb(255, 175, 85))),
+                        _ if refresh_failed => Some(("sync !", egui::Color32::from_rgb(255, 175, 85))),
+                        _ => None,
+                    };
+                    if let Some((label, color)) = warning {
                         p.text(egui::pos2(rect.right() - 12.0, rect.center().y - 10.0), egui::Align2::RIGHT_CENTER,
-                            "sync !", egui::FontId::proportional(10.0), egui::Color32::from_rgb(255, 175, 85));
+                            label, egui::FontId::proportional(10.0), color);
                     }
                     if unread > 0 {
                         let digits = if unread > 99 { "99+".to_string() } else { unread.to_string() };
@@ -2453,7 +2459,7 @@ impl TelegramApp {
                         p.rect_filled(pill, 8.5, color);
                         p.text(pill.center(), egui::Align2::CENTER_CENTER, digits, egui::FontId::proportional(10.5), egui::Color32::WHITE);
                     }
-                    if !refresh_failed && me.as_ref().map(|m| m.server_premium).unwrap_or(false) {
+                    if warning.is_none() && me.as_ref().map(|m| m.server_premium).unwrap_or(false) {
                         p.text(
                             egui::pos2(rect.right() - 12.0, rect.center().y - 10.0),
                             egui::Align2::RIGHT_CENTER,
