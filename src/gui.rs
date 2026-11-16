@@ -62,6 +62,7 @@ enum Cmd {
     /// connection gets one.
     SaveCreds { api_id: i32, api_hash: String },
     RefreshDialogs { account: String, request_id: u64 },
+    StashPeer { account: String, peer: PeerRef },
     OpenChat { account: String, peer_id: PeerId },
     MarkRead { account: String, peer_id: PeerId, max_id: i32 },
     DeleteMessage { account: String, peer_id: PeerId, msg_id: i32 },
@@ -276,7 +277,7 @@ enum Evt {
     AlarmSettingSaved { request_id: u64, result: Result<(), String> },
     NotifyDefault { account: String, category: Category, result: Result<Option<i32>, String>, observed: Instant },
     History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
-    Incoming { account: String, peer_id: PeerId, msg: MsgItem, peer_name: Option<String> },
+    Incoming { account: String, peer_id: PeerId, msg: MsgItem, peer_name: Option<String>, peer_ref: Option<PeerRef> },
     Edited { account: String, peer_id: PeerId, msg: MsgItem },
     // Non-channel IDs are account-wide; Telegram does not include a peer.
     Deleted { account: String, channel: Option<PeerId>, ids: Vec<i32> },
@@ -643,6 +644,7 @@ impl Worker {
                             let msg_id = message.id();
                             let peer_id = message.peer_id();
                             let peer_name = message.peer().and_then(|peer| peer.name()).map(str::to_owned);
+                            let peer_ref = message.peer_ref().await;
                             let msg = MsgItem {
                                 id: msg_id,
                                 outgoing: message.outgoing(),
@@ -683,6 +685,7 @@ impl Worker {
                                 peer_id,
                                 msg,
                                 peer_name,
+                                peer_ref,
                             });
                             ctx.request_repaint();
                         }
@@ -1322,6 +1325,9 @@ impl Worker {
                     }
                 }
                 Cmd::RefreshDialogs { account, request_id } => self.refresh_dialogs(&account, Some(request_id)).await,
+                Cmd::StashPeer { account, peer } => {
+                    if let Some(conn) = self.conns.get_mut(&account) { conn.peer_refs.insert(peer.id, peer); }
+                }
                 Cmd::OpenChat { account, peer_id } => self.fetch_history(&account, peer_id).await,
                 Cmd::MarkRead { account, peer_id, max_id } => self.mark_read(&account, peer_id, max_id).await,
                 Cmd::DeleteMessage { account, peer_id, msg_id } => self.delete_message(&account, peer_id, msg_id).await,
@@ -1725,10 +1731,20 @@ impl TelegramApp {
                 self.history_pending.remove(&(account, peer_id));
                 self.toast = Some((format!("history failed: {message}"), Instant::now()));
             }
-            Evt::Incoming { account, peer_id, msg, peer_name } => {
+            Evt::Incoming { account, peer_id, msg, peer_name, peer_ref } => {
                 let outgoing = msg.outgoing;
                 let message_id = msg.id;
                 self.update_live_dialog(&account, peer_id, &msg, peer_name);
+                if let Some(peer) = peer_ref {
+                    self.send_cmd(Cmd::StashPeer { account: account.clone(), peer });
+                    if let Some(row) = self.dialogs.get_mut(&account).and_then(|rows| rows.iter_mut().find(|row| row.peer_id == peer_id)) {
+                        row.resolved = true;
+                    }
+                    if self.sel_account.as_deref() == Some(account.as_str()) && self.sel_peer.get(&account) == Some(&peer_id)
+                        && !self.chats.contains_key(&(account.clone(), peer_id)) {
+                        self.request_history(account.clone(), peer_id);
+                    }
+                }
                 self.record_chat_change(&account, peer_id, HistoryChange::New(msg));
                 // A history fetch can populate the message before its live
                 // update arrives. Deduplicate unread independently of the
@@ -2400,7 +2416,7 @@ impl TelegramApp {
                 let me = self.me.get(&name).cloned();
                 let phone = account.phone.clone();
                 let (unread, alertable) = self.unread.account_counts(&name, &self.notifications, util::now_unix());
-                let refresh_failed = self.dialog_refresh.get(&name).is_some_and(|state| state.failed);
+                let refresh_failed = self.dialog_refresh.get(&name).is_some_and(|state| state.failed) || self.notify_retry.contains_key(&name);
                 let text = ui.visuals().text_color();
                 let response = painted_row(ui, selected, 54.0, |p, rect| {
                     let dot = egui::pos2(rect.left() + 15.0, rect.center().y);
@@ -3663,7 +3679,7 @@ mod message_cache_tests {
         app.notifications.set_peer("b", peer, Some(0), Instant::now());
         let before = Instant::now();
         let mut incoming = photo(11, "latest message"); incoming.outgoing = false;
-        app.apply_event(Evt::Incoming { account: "b".into(), peer_id: peer, msg: incoming, peer_name: Some("friend".into()) });
+        app.apply_event(Evt::Incoming { account: "b".into(), peer_id: peer, msg: incoming, peer_name: Some("friend".into()), peer_ref: None });
         assert_eq!(app.dialogs["b"][1].peer_id, peer);
         assert_eq!(app.dialogs["b"][1].preview.as_deref(), Some("latest message"));
         assert_eq!(app.unread.account_counts("b", &app.notifications, 1), (1, 1));
@@ -3686,7 +3702,7 @@ mod message_cache_tests {
         let peer = PeerId::user(9);
         let before = Instant::now();
         let mut msg = photo(20, "new chat"); msg.outgoing = false;
-        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: peer, msg, peer_name: Some("Alice".into()) });
+        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: peer, msg, peer_name: Some("Alice".into()), peer_ref: None });
         assert_eq!(app.dialogs["a"][0].name, "Alice");
         assert!(!app.dialogs["a"][0].resolved);
         app.apply_event(Evt::Dialogs { name: "a".into(), observed: before, items: vec![] });
@@ -3696,6 +3712,21 @@ mod message_cache_tests {
         let observed = Instant::now() + Duration::from_secs(1);
         app.apply_event(Evt::Dialogs { name: "a".into(), observed, items: vec![dialog(peer, "Alice", 20, false)] });
         assert!(app.dialogs["a"][0].resolved);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { peer_id, .. }) if peer_id == peer));
+    }
+
+    #[test]
+    fn live_peer_reference_allows_opening_a_new_chat_before_dialog_refresh() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.sel_account = Some("a".into());
+        let peer = PeerId::user(9);
+        let reference = PeerRef { id: peer, auth: Default::default() };
+        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: peer, msg: photo(2, "new"), peer_name: None, peer_ref: Some(reference) });
+        assert!(app.dialogs["a"][0].resolved);
+        app.select_peer(peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::StashPeer { peer, .. }) if peer.id == reference.id));
         assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { peer_id, .. }) if peer_id == peer));
     }
 
@@ -3773,7 +3804,7 @@ mod message_cache_tests {
         app.request_history("a".into(), user);
         assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
         app.apply_event(Evt::Edited { account: "a".into(), peer_id: user, msg: photo(10, "edited") });
-        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: user, msg: photo(11, "new"), peer_name: None });
+        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: user, msg: photo(11, "new"), peer_name: None, peer_ref: None });
         app.apply_event(Evt::Deleted { account: "a".into(), channel: None, ids: vec![11] });
         app.apply_event(Evt::History { account: "a".into(), peer_id: user, messages: vec![photo(10, "old"), photo(11, "deleted")] });
         assert_eq!(app.chats[&(String::from("a"), user)].len(), 1);
@@ -3878,7 +3909,7 @@ mod message_cache_tests {
             app.chats.insert(key.clone(), vec![]);
             app.chats.insert(other_account_key.clone(), vec![photo(42, "other account")]);
             app.chats.insert(other_peer_key.clone(), vec![photo(42, "other peer")]);
-            let incoming = Evt::Incoming { account: key.0.clone(), peer_id: peer, msg: photo(42, "update"), peer_name: None };
+            let incoming = Evt::Incoming { account: key.0.clone(), peer_id: peer, msg: photo(42, "update"), peer_name: None, peer_ref: None };
             let sent = Evt::Sent { account: key.0.clone(), peer_id: peer, result: Ok(photo(42, "sent")), source_path: None };
             if sent_first { app.apply_event(sent); app.apply_event(incoming); }
             else { app.apply_event(incoming); app.apply_event(sent); }
@@ -3968,8 +3999,8 @@ mod message_cache_tests {
         let mut msg = photo(10, "incoming");
         msg.outgoing = false;
         app.chats.insert(("account".into(), peer), vec![msg.clone()]);
-        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg: msg.clone(), peer_name: None });
-        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg, peer_name: None });
+        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg: msg.clone(), peer_name: None, peer_ref: None });
+        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg, peer_name: None, peer_ref: None });
         assert_eq!(app.unread.count("account", peer), 1);
         assert_eq!(app.chats[&(String::from("account"), peer)].len(), 1);
     }
