@@ -73,6 +73,20 @@ impl Unread {
         for peer in peers { self.deleted_from_peer(account, peer, ids); }
     }
 
+    /// Total unread messages across the account, plus the unmuted subset.
+    pub fn account_counts(&self, account: &str, notifications: &crate::notifications::Notifications, now: u64) -> (u32, u32) {
+        let mut total = 0u32;
+        let mut alertable = 0u32;
+        for ((name, peer), state) in &self.entries {
+            if name != account { continue; }
+            total = total.saturating_add(state.count);
+            if notifications.status(account, *peer, now) == crate::notifications::MuteStatus::Unmuted {
+                alertable = alertable.saturating_add(state.count);
+            }
+        }
+        (total, alertable)
+    }
+
     pub fn count(&self, account: &str, peer: PeerId) -> u32 {
         self.entries.get(&(account.to_owned(), peer)).map_or(0, |s| s.count)
     }
@@ -133,6 +147,21 @@ mod tests {
         assert!(u.any_alertable(&settings, 100)); // live unmute wakes the alarm
         settings.set_peer("a", p, Some(i32::MAX), t + Duration::from_secs(2));
         assert!(!u.any_alertable(&settings, 100));
+    }
+
+    #[test]
+    fn account_badges_sum_muted_and_unmuted_without_cross_account_leaks() {
+        let mut u = Unread::default();
+        let mut n = crate::notifications::Notifications::default();
+        let p = PeerId::user(1); let q = PeerId::user(2);
+        u.snapshot("a", p, 2, 10, 0); u.snapshot("a", q, 3, 20, 0);
+        u.snapshot("b", p, 7, 30, 0);
+        n.set_peer("a", p, Some(0), std::time::Instant::now());
+        n.set_peer("a", q, Some(i32::MAX), std::time::Instant::now());
+        assert_eq!(u.account_counts("a", &n, 1), (5, 2));
+        assert_eq!(u.account_counts("b", &n, 1), (7, 0));
+        u.read("a", p, 10, Some(0));
+        assert_eq!(u.account_counts("a", &n, 1), (3, 0));
     }
 
     #[test]

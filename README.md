@@ -67,6 +67,14 @@ an OpenGL-capable system and graphics driver.
   streams per account, unread badges, search filter, per-account status dots,
   `PRO` badge for genuine server premium. Runs on its own background tokio
   runtime; the UI never blocks on the network.
+- **Account unread badges and automatic chat refresh** — each account shows its
+  total unread message count, including muted chats. Red means at least one
+  unread chat is unmuted; grey means all are muted or still being checked.
+  Incoming messages update chat previews and badges immediately, with coalesced
+  server refreshes on activity, account selection, window refocus, and every two
+  minutes while online. Failed refreshes are retried and marked `sync !`.
+  Switching accounts returns to the chat list so an old open chat is not marked
+  read merely by selecting the account. Reopening a chat reloads its history.
 - **Message controls and sync** — use **Delete…** on a message and confirm
   **Delete for everyone**. Telegram enforces chat permissions and may reject a
   request; failures are shown and the message is kept. Live edits and deletions
