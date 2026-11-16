@@ -66,7 +66,7 @@ enum Cmd {
     /// Send a local image file as a photo; `caption` may be empty.
     SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String },
     /// Download a video message for inline playback (user-tapped; never automatic).
-    OpenVideo { account: String, peer_id: PeerId, msg_id: i32 },
+    OpenVideo { account: String, peer_id: PeerId, msg_id: i32, cache_key: String },
     /// GUI → worker echo of `Evt::StashMedia`; stashes the raw Media handle.
     StashMedia { cache_key: String, media: grammers_client::media::Media },
     BeginLogin { name: String, phone: String },
@@ -112,6 +112,8 @@ struct MsgItem {
     unix: i64,
     text: String,
     media: Option<MsgMedia>,
+    /// Telegram's media identity changes when the attachment is replaced.
+    media_token: Option<String>,
 }
 
 /// Insert or refresh a message in one account's chat. Telegram can deliver
@@ -154,8 +156,20 @@ fn apply_history_change(chat: &mut Vec<MsgItem>, change: &HistoryChange) {
 }
 
 /// Cache key used for an image attached to `msg_id` in `account`'s chat `peer_id`.
-fn media_cache_key(account: &str, peer_id: PeerId, msg_id: i32) -> String {
-    format!("{account}_{}_{msg_id}", peer_id)
+fn media_cache_key(account: &str, peer_id: PeerId, msg_id: i32, token: Option<&str>) -> String {
+    format!("{account}_{}_{msg_id}_{}", peer_id, token.unwrap_or("none"))
+}
+
+fn media_token(media: &grammers_client::media::Media) -> Option<String> {
+    match media {
+        grammers_client::media::Media::Photo(photo) => Some(format!("p{}", photo.id())),
+        grammers_client::media::Media::Document(document) => Some(format!("d{}", document.id())),
+        _ => None,
+    }
+}
+
+fn split_media_token(media: &Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)>) -> Option<String> {
+    media.as_ref().and_then(|(_, object, _)| object.as_ref()).and_then(media_token)
 }
 
 /// The Telegram peer-specific mute is optional: absent means inherit the
@@ -387,7 +401,8 @@ fn spawn_media_download(
         }
     }
     let account_s = account.to_string();
-    let cache_key = media_cache_key(account, peer_id, msg_id);
+    let token = media_token(&media);
+    let cache_key = media_cache_key(account, peer_id, msg_id, token.as_deref());
     let dir = data_dir.join("cache").join("media");
     let _ = std::fs::create_dir_all(&dir);
     let kind: MsgMedia = match &media {
@@ -583,9 +598,10 @@ impl Worker {
                                 unix: message.date().timestamp(),
                                 text: message.text().to_string(),
                                 media: media.as_ref().map(|(kind, _, _)| kind.clone()),
+                                media_token: split_media_token(&media),
                             };
                             if let Some((kind, obj, size)) = media {
-                                let cache_key = media_cache_key(&account, peer_id, msg_id);
+                                let cache_key = media_cache_key(&account, peer_id, msg_id, msg.media_token.as_deref());
                                 match kind {
                                     MsgMedia::Photo => {
                                         if let Some(o) = obj {
@@ -625,9 +641,10 @@ impl Worker {
                                 id: message.id(), outgoing: message.outgoing(),
                                 unix: message.date().timestamp(), text: message.text().to_string(),
                                 media: media.as_ref().map(|(kind, _, _)| kind.clone()),
+                                media_token: split_media_token(&media),
                             };
                             if let Some((kind, Some(obj), size)) = media {
-                                let cache_key = media_cache_key(&account, peer_id, msg.id);
+                                let cache_key = media_cache_key(&account, peer_id, msg.id, msg.media_token.as_deref());
                                 match kind {
                                     MsgMedia::Photo => spawn_media_download(&download_client, &data_dir,
                                         &account, peer_id, msg.id, obj, size, &evt_tx, &ctx, MAX_MEDIA_BYTES),
@@ -799,9 +816,10 @@ impl Worker {
                 unix: message.date().timestamp(),
                 text: message.text().to_string(),
                 media: media.as_ref().map(|(kind, _, _)| kind.clone()),
+                media_token: split_media_token(&media),
             };
             if let Some((kind, obj, size)) = media {
-                let cache_key = media_cache_key(account, peer_id, id);
+                let cache_key = media_cache_key(account, peer_id, id, msg.media_token.as_deref());
                 match kind {
                     // Photos auto-download (small); videos wait for a tap.
                     MsgMedia::Photo => {
@@ -892,6 +910,7 @@ impl Worker {
                 unix: message.date().timestamp(),
                 text,
                 media: None,
+                media_token: None,
             }),
             Err(e) => Err(e.to_string()),
         };
@@ -932,6 +951,7 @@ impl Worker {
                         unix: message.date().timestamp(),
                         text: caption,
                         media: Some(MsgMedia::Photo),
+                        media_token: message.media().as_ref().and_then(media_token),
                     })
                     .map_err(|e| e.to_string())
             }
@@ -941,8 +961,7 @@ impl Worker {
     }
 
     /// Kick off (or fast-path) an embedded playback for a video message.
-    async fn open_video(&mut self, account: &str, peer_id: PeerId, msg_id: i32) {
-        let cache_key = media_cache_key(account, peer_id, msg_id);
+    async fn open_video(&mut self, account: &str, peer_id: PeerId, msg_id: i32, cache_key: String) {
         let Some(client) = self.conns.get(account).map(|c| c.client.clone()) else {
             self.emit(Evt::VideoError { cache_key, message: "account is not connected".into() });
             return;
@@ -1250,8 +1269,8 @@ impl Worker {
                 Cmd::SendPhoto { account, peer_id, path, caption } => {
                     self.send_photo(&account, peer_id, path, caption).await
                 }
-                Cmd::OpenVideo { account, peer_id, msg_id } => {
-                    self.open_video(&account, peer_id, msg_id).await
+                Cmd::OpenVideo { account, peer_id, msg_id, cache_key } => {
+                    self.open_video(&account, peer_id, msg_id, cache_key).await
                 }
                 Cmd::StashMedia { cache_key, media } => {
                     if self.media_objects.len() >= 96 {
@@ -1364,7 +1383,7 @@ struct TelegramApp {
     evt_rx: std_mpsc::Receiver<Evt>,
     data_dir: PathBuf,
     ctx: egui::Context,
-    /// Decoded inline images, keyed by `media_cache_key(account, peer_id, msg_id)`.
+    /// Decoded inline images, keyed by account, peer, message and media identity.
     textures: HashMap<String, egui::TextureHandle>,
     /// Images whose download or decode failed (don't spin forever).
     failed_media: std::collections::HashSet<String>,
@@ -1659,7 +1678,7 @@ impl TelegramApp {
                 Ok(msg) => {
                     // A photo we just sent: cache the local file for rendering.
                     if let Some(src) = source_path {
-                        let key = media_cache_key(&account, peer_id, msg.id);
+                        let key = media_cache_key(&account, peer_id, msg.id, msg.media_token.as_deref());
                         let _ = self.decode_into_textures(&key, &src);
                         // Clear the staged attachment only if it is the one we sent.
                         if self.pending_attachment.as_deref() == Some(src.as_path()) {
@@ -2554,7 +2573,7 @@ impl TelegramApp {
             egui::Stroke::new(1.0, egui::Color32::from_gray(72))
         };
         let mut open_viewer: Option<ViewerState> = None;
-        let mut open_video: Option<(String, PeerId, i32)> = None;
+        let mut open_video: Option<(String, PeerId, i32, String)> = None;
         egui::Frame::default()
             .fill(fill)
             .stroke(stroke)
@@ -2565,7 +2584,7 @@ impl TelegramApp {
                     ui.set_max_width(360.0);
                     match &message.media {
                         Some(MsgMedia::Photo) => {
-                            let key = media_cache_key(account, peer_id, message.id);
+                            let key = media_cache_key(account, peer_id, message.id, message.media_token.as_deref());
                             if let Some(tex) = self.textures.get(&key) {
                                 let size = tex.size_vec2();
                                 let scale = (340.0 / size.x).min(260.0 / size.y).min(1.0);
@@ -2597,7 +2616,7 @@ impl TelegramApp {
                             }
                         }
                         Some(MsgMedia::Video(label)) => {
-                            let key = media_cache_key(account, peer_id, message.id);
+                            let key = media_cache_key(account, peer_id, message.id, message.media_token.as_deref());
                             let busy = self.pending_video_open.as_deref() == Some(key.as_str());
                             if busy {
                                 ui.horizontal(|ui| {
@@ -2614,7 +2633,7 @@ impl TelegramApp {
                                     .on_hover_text("download & play inline");
                                 if resp.clicked() {
                                     self.pending_video_open = Some(key.clone());
-                                    open_video = Some((account.to_string(), peer_id, message.id));
+                                    open_video = Some((account.to_string(), peer_id, message.id, key));
                                 }
                             }
                         }
@@ -2645,8 +2664,8 @@ impl TelegramApp {
         if let Some(viewer) = open_viewer {
             self.viewer = Some(viewer);
         }
-        if let Some((account, peer_id, msg_id)) = open_video {
-            self.send_cmd(Cmd::OpenVideo { account, peer_id, msg_id });
+        if let Some((account, peer_id, msg_id, cache_key)) = open_video {
+            self.send_cmd(Cmd::OpenVideo { account, peer_id, msg_id, cache_key });
         }
     }
 
@@ -3429,7 +3448,23 @@ mod message_cache_tests {
     use super::*;
 
     fn photo(id: i32, text: &str) -> MsgItem {
-        MsgItem { id, outgoing: true, unix: 1, text: text.into(), media: Some(MsgMedia::Photo) }
+        MsgItem { id, outgoing: true, unix: 1, text: text.into(), media: Some(MsgMedia::Photo), media_token: None }
+    }
+
+    #[test]
+    fn replacement_media_gets_a_distinct_cache_key() {
+        let peer = PeerId::user(1);
+        let old = media_cache_key("a", peer, 10, Some("p123"));
+        let new = media_cache_key("a", peer, 10, Some("p456"));
+        assert_ne!(old, new);
+        assert_ne!(old, media_cache_key("a", peer, 10, Some("d123")));
+        let mut before = photo(10, "caption");
+        before.media_token = Some("p123".into());
+        let mut after = before.clone();
+        after.media_token = Some("p456".into());
+        let mut chat = vec![before];
+        apply_history_change(&mut chat, &HistoryChange::Edit(after));
+        assert_eq!(chat[0].media_token.as_deref(), Some("p456"));
     }
 
     #[test]
