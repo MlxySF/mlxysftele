@@ -66,9 +66,11 @@ enum Cmd {
     OpenChat { account: String, peer_id: PeerId },
     MarkRead { account: String, peer_id: PeerId, max_id: i32 },
     DeleteMessage { account: String, peer_id: PeerId, msg_id: i32 },
-    SendText { account: String, peer_id: PeerId, text: String },
+    SendText { account: String, peer_id: PeerId, text: String, reply_to: Option<i32> },
     /// Send a local image file as a photo; `caption` may be empty.
-    SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String },
+    SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String, reply_to: Option<i32> },
+    ForwardMessage { account: String, source: PeerId, destination: PeerId, msg_id: i32, request_id: u64 },
+    React { account: String, peer_id: PeerId, msg_id: i32, reactions: Vec<ReactionKind> },
     /// Download a video message for inline playback (user-tapped; never automatic).
     OpenVideo { account: String, peer_id: PeerId, msg_id: i32, cache_key: String },
     /// GUI → worker echo of `Evt::StashMedia`; stashes the raw Media handle.
@@ -124,6 +126,20 @@ enum MsgMedia {
     Label(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReactionKind { Emoji(String), Custom(i64), Paid }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReactionItem { kind: ReactionKind, count: i32, chosen: bool }
+
+#[derive(Clone)]
+struct ReplyRef { id: i32, peer: Option<PeerId>, quote: Option<String> }
+
+#[derive(Clone)]
+struct ReplyDraft { account: String, peer_id: PeerId, msg_id: i32, preview: String }
+
+struct ForwardDraft { account: String, source: PeerId, msg_id: i32, search: String, request_id: Option<u64> }
+
 #[derive(Clone)]
 struct MsgItem {
     id: i32,
@@ -133,6 +149,9 @@ struct MsgItem {
     media: Option<MsgMedia>,
     /// Telegram's media identity changes when the attachment is replaced.
     media_token: Option<String>,
+    reply: Option<ReplyRef>,
+    forwarded: Option<String>,
+    reactions: Vec<ReactionItem>,
 }
 
 /// Update the visible row immediately; server snapshots later restore the
@@ -172,6 +191,11 @@ fn update_dialog_row(rows: &mut Vec<DialogItem>, peer_id: PeerId, msg: &MsgItem,
 /// Returns true only when this is a new message in the cache.
 fn upsert_chat_message(chat: &mut Vec<MsgItem>, msg: MsgItem) -> bool {
     if let Some(existing) = chat.iter_mut().find(|existing| existing.id == msg.id) {
+        let mut msg = msg;
+        // A duplicate new-message/send response can predate a reaction update.
+        if msg.reactions.is_empty() && !existing.reactions.is_empty() {
+            msg.reactions = existing.reactions.clone();
+        }
         *existing = msg;
         return false;
     }
@@ -191,6 +215,7 @@ enum HistoryChange {
     New(MsgItem),
     Edit(MsgItem),
     Delete(Vec<i32>),
+    Reactions { msg_id: i32, reactions: Vec<ReactionItem>, minimal: bool },
 }
 
 fn apply_history_change(chat: &mut Vec<MsgItem>, change: &HistoryChange) {
@@ -198,10 +223,23 @@ fn apply_history_change(chat: &mut Vec<MsgItem>, change: &HistoryChange) {
         HistoryChange::New(msg) => { upsert_chat_message(chat, msg.clone()); }
         HistoryChange::Edit(msg) => {
             if let Some(old) = chat.iter_mut().find(|old| old.id == msg.id) {
-                *old = msg.clone();
+                let mut edited = msg.clone();
+                if edited.reactions.is_empty() && !old.reactions.is_empty() { edited.reactions = old.reactions.clone(); }
+                *old = edited;
             }
         }
         HistoryChange::Delete(ids) => chat.retain(|msg| !ids.contains(&msg.id)),
+        HistoryChange::Reactions { msg_id, reactions, minimal } => {
+            if let Some(msg) = chat.iter_mut().find(|msg| msg.id == *msg_id) {
+                let mut next = reactions.clone();
+                if *minimal {
+                    for reaction in &mut next {
+                        if msg.reactions.iter().any(|old| old.kind == reaction.kind && old.chosen) { reaction.chosen = true; }
+                    }
+                }
+                msg.reactions = next;
+            }
+        }
     }
 }
 
@@ -220,6 +258,71 @@ fn media_token(media: &grammers_client::media::Media) -> Option<String> {
 
 fn split_media_token(media: &Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)>) -> Option<String> {
     media.as_ref().and_then(|(_, object, _)| object.as_ref()).and_then(media_token)
+}
+
+fn parse_reactions(raw: &tl::enums::MessageReactions) -> (Vec<ReactionItem>, bool) {
+    let tl::enums::MessageReactions::Reactions(raw) = raw;
+    let reactions = raw.results.iter().filter_map(|item| {
+        let tl::enums::ReactionCount::Count(item) = item;
+        let kind = match &item.reaction {
+            tl::enums::Reaction::Emoji(emoji) => ReactionKind::Emoji(emoji.emoticon.clone()),
+            tl::enums::Reaction::CustomEmoji(emoji) => ReactionKind::Custom(emoji.document_id),
+            tl::enums::Reaction::Paid => ReactionKind::Paid,
+            tl::enums::Reaction::Empty => return None,
+        };
+        Some(ReactionItem { kind, count: item.count, chosen: item.chosen_order.is_some() })
+    }).collect();
+    (reactions, raw.min)
+}
+
+fn message_reactions(message: &grammers_client::message::Message) -> (Vec<ReactionItem>, bool) {
+    let raw = match &message.raw {
+        tl::enums::Message::Message(m) => m.reactions.as_ref(),
+        tl::enums::Message::Service(m) => m.reactions.as_ref(),
+        _ => None,
+    };
+    raw.map(parse_reactions).unwrap_or_default()
+}
+
+fn message_reply(message: &grammers_client::message::Message) -> Option<ReplyRef> {
+    match message.reply_header()? {
+        tl::enums::MessageReplyHeader::Header(header) => Some(ReplyRef {
+            id: header.reply_to_msg_id?,
+            peer: header.reply_to_peer_id.map(Into::into),
+            quote: header.quote_text,
+        }),
+        _ => None,
+    }
+}
+
+fn message_forwarded(message: &grammers_client::message::Message) -> Option<String> {
+    match message.forward_header()? {
+        tl::enums::MessageFwdHeader::Header(header) => Some(header.from_name.or(header.post_author).unwrap_or_default()),
+    }
+}
+
+fn message_item(message: &grammers_client::message::Message, media: &Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)>) -> MsgItem {
+    MsgItem {
+        id: message.id(), outgoing: message.outgoing(), unix: message.date().timestamp(),
+        text: message.text().to_string(), media: media.as_ref().map(|(kind, _, _)| kind.clone()),
+        media_token: split_media_token(media), reply: message_reply(message),
+        forwarded: message_forwarded(message), reactions: message_reactions(message).0,
+    }
+}
+
+fn reaction_to_tl(kind: &ReactionKind) -> Option<tl::enums::Reaction> {
+    match kind {
+        ReactionKind::Emoji(emoticon) => Some(tl::types::ReactionEmoji { emoticon: emoticon.clone() }.into()),
+        ReactionKind::Custom(document_id) => Some(tl::types::ReactionCustomEmoji { document_id: *document_id }.into()),
+        ReactionKind::Paid => None,
+    }
+}
+
+fn preview_text(msg: &MsgItem) -> String {
+    let text = msg.text.lines().map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+    if !text.is_empty() { return truncate(&text, 64); }
+    match &msg.media { Some(MsgMedia::Photo) => "Photo".into(), Some(MsgMedia::Video(_)) => "Video".into(),
+        Some(MsgMedia::Label(label)) => label.clone(), None => "Message".into() }
 }
 
 /// The Telegram peer-specific mute is optional: absent means inherit the
@@ -283,6 +386,9 @@ enum Evt {
     Deleted { account: String, channel: Option<PeerId>, ids: Vec<i32> },
     DeleteResult { account: String, peer_id: PeerId, msg_id: i32, result: Result<(), String> },
     HistoryFailed { account: String, peer_id: PeerId, message: String },
+    Reactions { account: String, peer_id: PeerId, msg_id: i32, reactions: Vec<ReactionItem>, minimal: bool },
+    ReactionResult { account: String, peer_id: PeerId, msg_id: i32, observed: Instant, result: Result<Option<(Vec<ReactionItem>, bool)>, String> },
+    ForwardResult { account: String, destination: PeerId, request_id: u64, result: Result<Option<MsgItem>, String> },
     Sent {
         account: String,
         peer_id: PeerId,
@@ -645,14 +751,7 @@ impl Worker {
                             let peer_id = message.peer_id();
                             let peer_name = message.peer().and_then(|peer| peer.name()).map(str::to_owned);
                             let peer_ref = message.peer_ref().await;
-                            let msg = MsgItem {
-                                id: msg_id,
-                                outgoing: message.outgoing(),
-                                unix: message.date().timestamp(),
-                                text: message.text().to_string(),
-                                media: media.as_ref().map(|(kind, _, _)| kind.clone()),
-                                media_token: split_media_token(&media),
-                            };
+                            let msg = message_item(&message, &media);
                             if let Some((kind, obj, size)) = media {
                                 let cache_key = media_cache_key(&account, peer_id, msg_id, msg.media_token.as_deref());
                                 match kind {
@@ -692,12 +791,7 @@ impl Worker {
                         Ok(Update::MessageEdited(message)) => {
                             let peer_id = message.peer_id();
                             let media = split_media(&message);
-                            let msg = MsgItem {
-                                id: message.id(), outgoing: message.outgoing(),
-                                unix: message.date().timestamp(), text: message.text().to_string(),
-                                media: media.as_ref().map(|(kind, _, _)| kind.clone()),
-                                media_token: split_media_token(&media),
-                            };
+                            let msg = message_item(&message, &media);
                             if let Some((kind, Some(obj), size)) = media {
                                 let cache_key = media_cache_key(&account, peer_id, msg.id, msg.media_token.as_deref());
                                 match kind {
@@ -717,6 +811,12 @@ impl Worker {
                             ctx.request_repaint();
                         }
                         Ok(Update::Raw(update)) => {
+                            if let tl::enums::Update::MessageReactions(ref update) = update.raw {
+                                let (reactions, minimal) = parse_reactions(&update.reactions);
+                                let _ = evt_tx.send(Evt::Reactions { account: account.clone(),
+                                    peer_id: update.peer.clone().into(), msg_id: update.msg_id, reactions, minimal });
+                                ctx.request_repaint();
+                            }
                             let read = match update.raw {
                                 tl::enums::Update::ReadHistoryInbox(ref r) if r.top_msg_id.is_none() =>
                                     Some((r.peer.clone().into(), r.max_id, r.still_unread_count.max(0) as u32)),
@@ -875,14 +975,7 @@ impl Worker {
             };
             let id = message.id();
             let media = split_media(&message);
-            let msg = MsgItem {
-                id,
-                outgoing: message.outgoing(),
-                unix: message.date().timestamp(),
-                text: message.text().to_string(),
-                media: media.as_ref().map(|(kind, _, _)| kind.clone()),
-                media_token: split_media_token(&media),
-            };
+            let msg = message_item(&message, &media);
             if let Some((kind, obj, size)) = media {
                 let cache_key = media_cache_key(account, peer_id, id, msg.media_token.as_deref());
                 match kind {
@@ -949,7 +1042,7 @@ impl Worker {
         self.emit(Evt::DeleteResult { account: account.into(), peer_id, msg_id, result });
     }
 
-    async fn send_text(&mut self, account: &str, peer_id: PeerId, text: String) {
+    async fn send_text(&mut self, account: &str, peer_id: PeerId, text: String, reply_to: Option<i32>) {
         let Some(conn) = self.conns.get(account) else {
             self.emit(Evt::Sent {
                 account: account.to_string(),
@@ -968,21 +1061,14 @@ impl Worker {
             });
             return;
         };
-        let result = match conn.client.send_message(peer_ref, text.as_str()).await {
-            Ok(message) => Ok(MsgItem {
-                id: message.id(),
-                outgoing: true,
-                unix: message.date().timestamp(),
-                text,
-                media: None,
-                media_token: None,
-            }),
-            Err(e) => Err(e.to_string()),
-        };
+        let input = grammers_client::message::InputMessage::new().text(text).reply_to(reply_to);
+        let result = conn.client.send_message(peer_ref, input).await
+            .map(|message| { let media = split_media(&message); message_item(&message, &media) })
+            .map_err(|e| e.to_string());
         self.emit(Evt::Sent { account: account.to_string(), peer_id, result, source_path: None });
     }
 
-    async fn send_photo(&mut self, account: &str, peer_id: PeerId, path: PathBuf, caption: String) {
+    async fn send_photo(&mut self, account: &str, peer_id: PeerId, path: PathBuf, caption: String, reply_to: Option<i32>) {
         let Some(conn) = self.conns.get(account) else {
             self.emit(Evt::Sent {
                 account: account.to_string(),
@@ -1006,23 +1092,51 @@ impl Worker {
             Ok(uploaded) => {
                 let message = grammers_client::message::InputMessage::new()
                     .text(caption.clone())
-                    .photo(uploaded);
+                    .photo(uploaded)
+                    .reply_to(reply_to);
                 conn.client
                     .send_message(peer_ref, message)
                     .await
-                    .map(|message| MsgItem {
-                        id: message.id(),
-                        outgoing: true,
-                        unix: message.date().timestamp(),
-                        text: caption,
-                        media: Some(MsgMedia::Photo),
-                        media_token: message.media().as_ref().and_then(media_token),
-                    })
+                    .map(|message| { let media = split_media(&message); message_item(&message, &media) })
                     .map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("upload failed: {e}")),
         };
         self.emit(Evt::Sent { account: account.to_string(), peer_id, result, source_path: Some(path) });
+    }
+
+    async fn forward_message(&mut self, account: &str, source: PeerId, destination: PeerId, msg_id: i32, request_id: u64) {
+        let result = match self.conns.get(account).and_then(|conn| {
+            Some((conn.client.clone(), *conn.peer_refs.get(&source)?, *conn.peer_refs.get(&destination)?))
+        }) {
+            None => Err("account or chat is not connected; refresh the chat list".into()),
+            Some((client, from, to)) => match client.forward_messages(to, &[msg_id], from).await {
+                Err(error) => Err(error.to_string()),
+                Ok(messages) => Ok(messages.into_iter().next().flatten().map(|message| {
+                    let media = split_media(&message);
+                    message_item(&message, &media)
+                })),
+            }
+        };
+        self.emit(Evt::ForwardResult { account: account.into(), destination, request_id, result });
+    }
+
+    async fn react(&mut self, account: &str, peer_id: PeerId, msg_id: i32, reactions: Vec<ReactionKind>) {
+        let observed = Instant::now();
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            None => Err("account or chat is not connected".into()),
+            Some((client, peer)) => {
+                let raw: Vec<tl::enums::Reaction> = reactions.iter().filter_map(reaction_to_tl).collect();
+                match client.send_reactions(peer, msg_id, raw).await {
+                    Err(error) => Err(error.to_string()),
+                    Ok(()) => match client.get_messages_by_id(peer, &[msg_id]).await {
+                        Ok(messages) => Ok(messages.into_iter().next().flatten().map(|message| message_reactions(&message))),
+                        Err(_) => Ok(None), // Sent, but the authoritative refresh failed.
+                    },
+                }
+            }
+        };
+        self.emit(Evt::ReactionResult { account: account.into(), peer_id, msg_id, observed, result });
     }
 
     /// Kick off (or fast-path) an embedded playback for a video message.
@@ -1331,12 +1445,14 @@ impl Worker {
                 Cmd::OpenChat { account, peer_id } => self.fetch_history(&account, peer_id).await,
                 Cmd::MarkRead { account, peer_id, max_id } => self.mark_read(&account, peer_id, max_id).await,
                 Cmd::DeleteMessage { account, peer_id, msg_id } => self.delete_message(&account, peer_id, msg_id).await,
-                Cmd::SendText { account, peer_id, text } => {
-                    self.send_text(&account, peer_id, text).await
+                Cmd::SendText { account, peer_id, text, reply_to } => {
+                    self.send_text(&account, peer_id, text, reply_to).await
                 }
-                Cmd::SendPhoto { account, peer_id, path, caption } => {
-                    self.send_photo(&account, peer_id, path, caption).await
+                Cmd::SendPhoto { account, peer_id, path, caption, reply_to } => {
+                    self.send_photo(&account, peer_id, path, caption, reply_to).await
                 }
+                Cmd::ForwardMessage { account, source, destination, msg_id, request_id } => self.forward_message(&account, source, destination, msg_id, request_id).await,
+                Cmd::React { account, peer_id, msg_id, reactions } => self.react(&account, peer_id, msg_id, reactions).await,
                 Cmd::OpenVideo { account, peer_id, msg_id, cache_key } => {
                     self.open_video(&account, peer_id, msg_id, cache_key).await
                 }
@@ -1481,6 +1597,12 @@ struct TelegramApp {
     sel_peer: HashMap<String, PeerId>,
     chats: HashMap<(String, PeerId), Vec<MsgItem>>,
     history_pending: HashMap<(String, PeerId), Vec<HistoryChange>>,
+    reply_draft: Option<ReplyDraft>,
+    forward_draft: Option<ForwardDraft>,
+    next_forward_id: u64,
+    reaction_input: String,
+    pending_reactions: std::collections::HashSet<(String, PeerId, i32)>,
+    reaction_versions: HashMap<(String, PeerId, i32), Instant>,
     unread_refresh_after: HashMap<String, Instant>,
     confirm_delete: Option<(String, PeerId, i32)>,
     deleting: std::collections::HashSet<(String, PeerId, i32)>,
@@ -1541,6 +1663,12 @@ impl TelegramApp {
             sel_peer: HashMap::new(),
             chats: HashMap::new(),
             history_pending: HashMap::new(),
+            reply_draft: None,
+            forward_draft: None,
+            next_forward_id: 0,
+            reaction_input: String::new(),
+            pending_reactions: std::collections::HashSet::new(),
+            reaction_versions: HashMap::new(),
             unread_refresh_after: HashMap::new(),
             confirm_delete: None,
             deleting: std::collections::HashSet::new(),
@@ -1597,6 +1725,10 @@ impl TelegramApp {
                 self.dialog_refresh.retain(|a, _| known.contains(a));
                 self.chats.retain(|(a, _), _| known.contains(a));
                 self.history_pending.retain(|(a, _), _| known.contains(a));
+                self.pending_reactions.retain(|(a, _, _)| known.contains(a));
+                self.reaction_versions.retain(|(a, _, _), _| known.contains(a));
+                if self.reply_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.reply_draft = None; }
+                if self.forward_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.forward_draft = None; }
                 self.unread_refresh_after.retain(|a, _| known.contains(a));
                 self.deleting.retain(|(a, _, _)| known.contains(a));
                 if self.confirm_delete.as_ref().is_some_and(|(a, _, _)| !known.contains(a)) { self.confirm_delete = None; }
@@ -1725,6 +1857,10 @@ impl TelegramApp {
                     let excess = messages.len() - MAX_CACHED_MESSAGES;
                     messages.drain(..excess);
                 }
+                self.reaction_versions.retain(|(a, peer, id), _| {
+                    (a != &key.0 || *peer != key.1) || messages.iter().any(|message| message.id == *id)
+                        || self.pending_reactions.contains(&(a.clone(), *peer, *id))
+                });
                 self.chats.insert(key, messages);
             }
             Evt::HistoryFailed { account, peer_id, message } => {
@@ -1772,6 +1908,14 @@ impl TelegramApp {
                     }).cloned().collect();
                 for (_, peer) in keys { self.record_chat_change(&account, peer, HistoryChange::Delete(ids.clone())); }
                 self.unread.deleted(&account, channel, &ids);
+                if self.reply_draft.as_ref().is_some_and(|d| d.account == account && ids.contains(&d.msg_id) && match channel {
+                    Some(channel) => d.peer_id == channel,
+                    None => d.peer_id.kind() != PeerKind::Channel,
+                }) { self.reply_draft = None; }
+                self.reaction_versions.retain(|(a, peer, id), _| !(a == &account && ids.contains(id) && match channel {
+                    Some(channel) => *peer == channel,
+                    None => peer.kind() != PeerKind::Channel,
+                }));
                 self.live_dialogs.retain(|(a, peer), live| !(a == &account && ids.contains(&live.msg.id) && match channel {
                     Some(channel) => *peer == channel,
                     None => peer.kind() != PeerKind::Channel,
@@ -1785,11 +1929,55 @@ impl TelegramApp {
                     Ok(()) => {
                         self.record_chat_change(&account, peer_id, HistoryChange::Delete(vec![msg_id]));
                         self.unread.deleted_from_peer(&account, peer_id, &[msg_id]);
+                        if self.reply_draft.as_ref().is_some_and(|d| d.account == account && d.peer_id == peer_id && d.msg_id == msg_id) { self.reply_draft = None; }
+                        self.reaction_versions.remove(&(account.clone(), peer_id, msg_id));
                         self.unread_refresh_after.insert(account.clone(), Instant::now());
                         self.live_dialogs.remove(&(account.clone(), peer_id));
                         self.request_dialog_refresh(&account);
                     }
                     Err(e) => self.toast = Some((format!("Could not delete for everyone: {e}"), Instant::now())),
+                }
+            }
+            Evt::Reactions { account, peer_id, msg_id, reactions, minimal } => {
+                let key = (account.clone(), peer_id);
+                if self.history_pending.contains_key(&key) || self.chats.get(&key).is_some_and(|chat| chat.iter().any(|msg| msg.id == msg_id)) {
+                    self.reaction_versions.insert((account.clone(), peer_id, msg_id), Instant::now());
+                }
+                self.record_chat_change(&account, peer_id, HistoryChange::Reactions { msg_id, reactions, minimal });
+            }
+            Evt::ReactionResult { account, peer_id, msg_id, observed, result } => {
+                let key = (account.clone(), peer_id, msg_id);
+                self.pending_reactions.remove(&key);
+                match result {
+                    Err(error) => self.toast = Some((format!("Reaction failed: {error}"), Instant::now())),
+                    Ok(reactions) => {
+                        let newer = self.reaction_versions.get(&key).is_some_and(|t| *t > observed);
+                        if let Some((reactions, minimal)) = reactions.filter(|_| !newer) {
+                            self.reaction_versions.insert(key, Instant::now());
+                            self.record_chat_change(&account, peer_id, HistoryChange::Reactions { msg_id, reactions, minimal });
+                        } else {
+                            // A concurrent update or a failed read-back needs a fresh snapshot.
+                            self.request_history(account, peer_id);
+                        }
+                    }
+                }
+            }
+            Evt::ForwardResult { account, destination, request_id, result } => {
+                let matches_draft = self.forward_draft.as_ref().is_some_and(|d| d.request_id == Some(request_id));
+                if matches_draft { if let Some(draft) = &mut self.forward_draft { draft.request_id = None; } }
+                match result {
+                    Err(error) => self.toast = Some((format!("Forward failed: {error}"), Instant::now())),
+                    Ok(message) => {
+                        if matches_draft { self.forward_draft = None; }
+                        if let Some(message) = message {
+                            self.update_live_dialog(&account, destination, &message, None);
+                            self.record_chat_change(&account, destination, HistoryChange::New(message));
+                        }
+                        // Re-fetch destination history for media handles and unknown IDs.
+                        if self.chats.contains_key(&(account.clone(), destination)) { self.request_history(account.clone(), destination); }
+                        self.request_dialog_refresh(&account);
+                        self.toast = Some(("Forward request sent".into(), Instant::now()));
+                    }
                 }
             }
             Evt::Sent { account, peer_id, result, source_path } => match result {
@@ -1946,6 +2134,19 @@ impl TelegramApp {
         if let Some(delay) = wait { self.ctx.request_repaint_after(delay); }
     }
 
+    fn react_to_message(&mut self, account: &str, peer_id: PeerId, msg: &MsgItem, kind: ReactionKind) {
+        if kind == ReactionKind::Paid { return; }
+        let key = (account.to_owned(), peer_id, msg.id);
+        if self.pending_reactions.contains(&key) { return; }
+        let mut chosen: Vec<_> = msg.reactions.iter().filter(|reaction| reaction.chosen && reaction.kind != ReactionKind::Paid)
+            .map(|reaction| reaction.kind.clone()).collect();
+        if let Some(index) = chosen.iter().position(|item| *item == kind) { chosen.remove(index); }
+        else { chosen.push(kind); }
+        if self.cmd_tx.send(Cmd::React { account: account.to_owned(), peer_id, msg_id: msg.id, reactions: chosen }).is_ok() {
+            self.pending_reactions.insert(key);
+        } else { self.toast = Some(("Reaction failed: worker stopped".into(), Instant::now())); }
+    }
+
     fn record_chat_change(&mut self, account: &str, peer_id: PeerId, change: HistoryChange) {
         let key = (account.to_owned(), peer_id);
         if let Some(chat) = self.chats.get_mut(&key) { apply_history_change(chat, &change); }
@@ -2021,6 +2222,7 @@ impl TelegramApp {
         self.sel_account = Some(name.clone());
         self.pending_attachment = None;
         if changed {
+            self.reply_draft = None;
             // Switching accounts must not silently read the previously open chat.
             self.sel_peer.remove(&name);
             self.ctx.memory_mut(|memory| memory.surrender_focus(composer_id()));
@@ -2036,6 +2238,7 @@ impl TelegramApp {
 
     fn select_peer(&mut self, peer_id: PeerId) {
         if let Some(account) = self.sel_account.clone() {
+            if self.sel_peer.get(&account) != Some(&peer_id) { self.reply_draft = None; }
             self.sel_peer.insert(account.clone(), peer_id);
             self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
             self.pending_attachment = None;
@@ -2219,6 +2422,8 @@ impl eframe::App for TelegramApp {
         if esc {
             if self.confirm_delete.take().is_some() {
                 // deletion cancelled
+            } else if self.forward_draft.take().is_some() {
+                // forward picker closed (an already sent request may still complete)
             } else if self.viewer.take().is_some() {
                 // viewer closed
             } else if self.video.take().is_some() {
@@ -2229,6 +2434,8 @@ impl eframe::App for TelegramApp {
                 self.show_settings = false;
             } else if self.show_add {
                 self.show_add = false;
+            } else if self.reply_draft.take().is_some() {
+                // reply cancelled
             } else if let Some(account) = self.sel_account.clone() {
                 // "close the chat" — return to the "pick a chat" screen.
                 self.sel_peer.remove(&account);
@@ -2293,6 +2500,7 @@ impl eframe::App for TelegramApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
+        self.ui_forward_window(ui.ctx());
         self.ui_delete_confirmation(ui.ctx());
         self.ui_settings_window(ui.ctx());
         self.ui_add_window(ui.ctx());
@@ -2308,7 +2516,7 @@ impl TelegramApp {
     /// visible window. Do not mark a hidden account/chat or an overlaid chat read.
     fn mark_visible_chat_read(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.focused && i.viewport().visible() != Some(false))
-            || self.show_settings || self.show_add || self.show_picker || self.viewer.is_some() || self.video.is_some() || self.confirm_delete.is_some() {
+            || self.show_settings || self.show_add || self.show_picker || self.viewer.is_some() || self.video.is_some() || self.confirm_delete.is_some() || self.forward_draft.is_some() {
             return;
         }
         let Some(account) = self.sel_account.clone() else { return };
@@ -2636,11 +2844,21 @@ impl TelegramApp {
         ui.separator();
 
         let has_attachment = self.pending_attachment.is_some();
+        let reply = self.reply_draft.as_ref().filter(|r| r.account == account && r.peer_id == peer_id).cloned();
+        let has_reply = reply.is_some();
         // Composer docked at the bottom; history fills the middle.
         egui::Panel::bottom("composer_dock")
             .show_separator_line(false)
-            .exact_size(if has_attachment { 128.0 } else { 90.0 })
+            .exact_size(90.0 + if has_attachment { 38.0 } else { 0.0 } + if has_reply { 38.0 } else { 0.0 })
             .show(ui, |ui| {
+                if let Some(reply) = &reply {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(format!("Replying to #{}: {}", reply.msg_id, truncate(&reply.preview, 55))).small());
+                        if ui.small_button("×").on_hover_text("Cancel reply").clicked() { self.reply_draft = None; }
+                    });
+                }
                 if self.pending_attachment.is_some() {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -2704,12 +2922,20 @@ impl TelegramApp {
                     if (enter && can_send) || send_clicked {
                         response.request_focus();
                         let text = self.composer.trim().to_string();
-                        let attachment = self.pending_attachment.take();
-                        self.composer.clear();
-                        if let Some(path) = attachment {
-                            self.send_cmd(Cmd::SendPhoto { account: account.clone(), peer_id, path, caption: text });
+                        let reply_to = self.reply_draft.as_ref().filter(|r| r.account == account && r.peer_id == peer_id).map(|r| r.msg_id);
+                        let command = if let Some(path) = self.pending_attachment.clone() {
+                            Some(Cmd::SendPhoto { account: account.clone(), peer_id, path, caption: text, reply_to })
                         } else if !text.is_empty() {
-                            self.send_cmd(Cmd::SendText { account: account.clone(), peer_id, text });
+                            Some(Cmd::SendText { account: account.clone(), peer_id, text, reply_to })
+                        } else { None };
+                        if let Some(command) = command {
+                            if self.cmd_tx.send(command).is_ok() {
+                                self.pending_attachment = None;
+                                self.composer.clear();
+                                self.reply_draft = None;
+                            } else {
+                                self.toast = Some(("Send failed: worker stopped".into(), Instant::now()));
+                            }
                         }
                     }
                     ui.add_space(6.0);
@@ -2785,6 +3011,13 @@ impl TelegramApp {
         } else {
             egui::Stroke::new(1.0, egui::Color32::from_gray(72))
         };
+        let reply_label = message.reply.as_ref().map(|reply| {
+            let source = if reply.peer.is_none_or(|peer| peer == peer_id) {
+                self.chats.get(&(account.to_owned(), peer_id)).and_then(|chat| chat.iter().find(|m| m.id == reply.id)).map(preview_text)
+            } else { None };
+            let preview = reply.quote.clone().or(source).unwrap_or_else(|| "Original message unavailable".into());
+            format!("Reply to #{} · {}", reply.id, truncate(&preview, 64))
+        });
         let mut open_viewer: Option<ViewerState> = None;
         let mut open_video: Option<(String, PeerId, i32, String)> = None;
         egui::Frame::default()
@@ -2795,6 +3028,13 @@ impl TelegramApp {
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.set_max_width(360.0);
+                    if let Some(forwarded) = &message.forwarded {
+                        let label = if forwarded.is_empty() { "Forwarded message".to_owned() } else { format!("Forwarded from {}", truncate(forwarded, 40)) };
+                        ui.label(egui::RichText::new(label).small().color(time_color));
+                    }
+                    if let Some(reply) = &reply_label {
+                        ui.label(egui::RichText::new(reply).small().color(time_color));
+                    }
                     match &message.media {
                         Some(MsgMedia::Photo) => {
                             let key = media_cache_key(account, peer_id, message.id, message.media_token.as_deref());
@@ -2864,8 +3104,52 @@ impl TelegramApp {
                         let color = if outgoing { egui::Color32::WHITE } else { text_color };
                         ui.label(egui::RichText::new(&message.text).color(color).size(13.5));
                     }
-                    ui.horizontal(|ui| {
+                    let reaction_pending = self.pending_reactions.contains(&(account.to_owned(), peer_id, message.id));
+                    if !message.reactions.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for reaction in &message.reactions {
+                                let label = match &reaction.kind {
+                                    ReactionKind::Emoji(emoji) => emoji.clone(),
+                                    ReactionKind::Custom(id) => format!("custom {id}"),
+                                    ReactionKind::Paid => "⭐".into(),
+                                };
+                                let mut button = egui::Button::new(format!("{label} {}", reaction.count)).small();
+                                if reaction.chosen { button = button.fill(egui::Color32::from_rgb(50, 105, 155)); }
+                                if ui.add_enabled(!reaction_pending && reaction.kind != ReactionKind::Paid, button).on_hover_text("Toggle reaction").clicked() {
+                                    self.react_to_message(account, peer_id, message, reaction.kind.clone());
+                                }
+                            }
+                        });
+                    }
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(format_msg_time(message.unix)).small().color(time_color));
+                        if ui.small_button("Reply").clicked() {
+                            self.reply_draft = Some(ReplyDraft { account: account.to_owned(), peer_id, msg_id: message.id, preview: preview_text(message) });
+                            self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+                        }
+                        if ui.small_button("Forward").clicked() {
+                            self.forward_draft = Some(ForwardDraft { account: account.to_owned(), source: peer_id, msg_id: message.id, search: String::new(), request_id: None });
+                        }
+                        ui.menu_button("React", |ui| {
+                            ui.label("Choose a reaction");
+                            ui.horizontal_wrapped(|ui| {
+                                for emoji in ["👍", "❤️", "😂", "😮", "😢", "🔥", "👎", "🎉"] {
+                                    if ui.add_enabled(!reaction_pending, egui::Button::new(emoji)).clicked() {
+                                        self.react_to_message(account, peer_id, message, ReactionKind::Emoji(emoji.to_owned()));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.reaction_input).hint_text("Other emoji").desired_width(110.0));
+                                let emoji = self.reaction_input.trim().to_owned();
+                                if ui.add_enabled(!reaction_pending && !emoji.is_empty(), egui::Button::new("Add")).clicked() {
+                                    self.react_to_message(account, peer_id, message, ReactionKind::Emoji(emoji));
+                                    self.reaction_input.clear();
+                                    ui.close();
+                                }
+                            });
+                        });
                         let pending = self.deleting.contains(&(account.to_owned(), peer_id, message.id));
                         if ui.add_enabled(!pending, egui::Button::new("Delete…").small())
                             .on_hover_text("Delete this message for everyone").clicked() {
@@ -2880,6 +3164,42 @@ impl TelegramApp {
         if let Some((account, peer_id, msg_id, cache_key)) = open_video {
             self.send_cmd(Cmd::OpenVideo { account, peer_id, msg_id, cache_key });
         }
+    }
+
+    fn ui_forward_window(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.forward_draft.take() else { return };
+        let mut close = false;
+        egui::Window::new("Forward message")
+            .collapsible(false).resizable(true).default_width(340.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Choose a destination in account {}", draft.account));
+                ui.add(egui::TextEdit::singleline(&mut draft.search).hint_text("Search chats…"));
+                let filter = draft.search.trim().to_lowercase();
+                let dialogs = self.dialogs.get(&draft.account).cloned().unwrap_or_default();
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    let mut found = false;
+                    for dialog in dialogs.iter().filter(|d| filter.is_empty() || d.name.to_lowercase().contains(&filter)) {
+                        found = true;
+                        ui.horizontal(|ui| {
+                            ui.label(truncate(&dialog.name, 30));
+                            if ui.add_enabled(draft.request_id.is_none() && dialog.resolved, egui::Button::new("Forward"))
+                                .on_hover_text("Forward the original Telegram message to this chat").clicked() {
+                                self.next_forward_id = self.next_forward_id.wrapping_add(1);
+                                let request_id = self.next_forward_id;
+                                if self.cmd_tx.send(Cmd::ForwardMessage { account: draft.account.clone(), source: draft.source,
+                                    destination: dialog.peer_id, msg_id: draft.msg_id, request_id }).is_ok() {
+                                    draft.request_id = Some(request_id);
+                                } else { self.toast = Some(("Forward failed: worker stopped".into(), Instant::now())); }
+                            }
+                        });
+                    }
+                    if !found { ui.label("No matching chats. Refresh the account's chat list and try again."); }
+                });
+                if draft.request_id.is_some() { ui.label("Forwarding…"); }
+                if ui.button("Cancel").clicked() { close = true; }
+            });
+        if !close { self.forward_draft = Some(draft); }
     }
 
     fn ui_delete_confirmation(&mut self, ctx: &egui::Context) {
@@ -3661,7 +3981,7 @@ mod message_cache_tests {
     use super::*;
 
     fn photo(id: i32, text: &str) -> MsgItem {
-        MsgItem { id, outgoing: true, unix: 1, text: text.into(), media: Some(MsgMedia::Photo), media_token: None }
+        MsgItem { id, outgoing: true, unix: 1, text: text.into(), media: Some(MsgMedia::Photo), media_token: None, reply: None, forwarded: None, reactions: vec![] }
     }
 
     fn dialog(peer_id: PeerId, name: &str, top: i32, pinned: bool) -> DialogItem {
@@ -3781,6 +4101,94 @@ mod message_cache_tests {
     }
 
     #[test]
+    fn reactions_toggle_without_losing_other_choices_and_reconcile_live_updates() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let mut msg = photo(7, "hello");
+        let thumbs = ReactionKind::Emoji("👍".into());
+        let heart = ReactionKind::Emoji("❤️".into());
+        msg.reactions = vec![ReactionItem { kind: thumbs.clone(), count: 2, chosen: true }, ReactionItem { kind: heart.clone(), count: 1, chosen: true }];
+        app.chats.insert(("a".into(), peer), vec![msg.clone()]);
+        app.react_to_message("a", peer, &msg, thumbs.clone());
+        app.react_to_message("a", peer, &msg, thumbs.clone()); // no duplicate request while pending
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::React { reactions, .. }) if reactions == vec![heart.clone()]));
+        assert!(cmd_rx.try_recv().is_err());
+        let observed = Instant::now() - Duration::from_secs(1);
+        app.apply_event(Evt::Reactions { account: "a".into(), peer_id: peer, msg_id: 7,
+            reactions: vec![ReactionItem { kind: heart.clone(), count: 3, chosen: false }], minimal: true });
+        assert!(app.chats[&(String::from("a"), peer)][0].reactions[0].chosen);
+        app.apply_event(Evt::ReactionResult { account: "a".into(), peer_id: peer, msg_id: 7, observed,
+            result: Ok(Some((vec![ReactionItem { kind: thumbs, count: 1, chosen: false }], false))) });
+        assert_eq!(app.chats[&(String::from("a"), peer)][0].reactions[0].kind, heart);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { peer_id, .. }) if peer_id == peer));
+        assert!(!app.pending_reactions.contains(&(String::from("a"), peer, 7)));
+    }
+
+    #[test]
+    fn reaction_updates_replay_over_stale_history_without_cross_chat_leaks() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::channel(1); let other = PeerId::channel(2);
+        app.chats.insert(("a".into(), other), vec![photo(9, "other")]);
+        app.request_history("a".into(), peer);
+        let reactions = vec![ReactionItem { kind: ReactionKind::Emoji("👍".into()), count: 3, chosen: true }];
+        app.apply_event(Evt::Reactions { account: "a".into(), peer_id: peer, msg_id: 9, reactions: reactions.clone(), minimal: false });
+        app.apply_event(Evt::History { account: "a".into(), peer_id: peer, messages: vec![photo(9, "stale")] });
+        assert_eq!(app.chats[&(String::from("a"), peer)][0].reactions, reactions);
+        assert!(app.chats[&(String::from("a"), other)][0].reactions.is_empty());
+    }
+
+    #[test]
+    fn reaction_tl_roundtrip_preserves_counts_choices_and_custom_kind() {
+        let raw = tl::types::MessageReactions { min: false, can_see_list: false, reactions_as_tags: false,
+            results: vec![tl::types::ReactionCount { chosen_order: Some(0),
+                reaction: tl::types::ReactionEmoji { emoticon: "👍".into() }.into(), count: 4 }.into(),
+                tl::types::ReactionCount { chosen_order: None,
+                    reaction: tl::types::ReactionCustomEmoji { document_id: 123 }.into(), count: 2 }.into()],
+            recent_reactions: None, top_reactors: None };
+        let (reactions, minimal) = parse_reactions(&raw.into());
+        assert!(!minimal);
+        assert_eq!(reactions[0], ReactionItem { kind: ReactionKind::Emoji("👍".into()), count: 4, chosen: true });
+        assert_eq!(reactions[1].kind, ReactionKind::Custom(123));
+        assert!(reaction_to_tl(&ReactionKind::Paid).is_none());
+    }
+
+    #[test]
+    fn reply_target_is_chat_scoped_and_cleared_if_deleted_or_switching() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.sel_account = Some("a".into()); app.sel_peer.insert("a".into(), peer);
+        app.reply_draft = Some(ReplyDraft { account: "a".into(), peer_id: peer, msg_id: 5, preview: "hi".into() });
+        app.apply_event(Evt::Deleted { account: "b".into(), channel: None, ids: vec![5] });
+        assert!(app.reply_draft.is_some());
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: None, ids: vec![5] });
+        assert!(app.reply_draft.is_none());
+        app.reply_draft = Some(ReplyDraft { account: "a".into(), peer_id: peer, msg_id: 7, preview: "hi".into() });
+        app.select_account("b".into());
+        assert!(app.reply_draft.is_none());
+    }
+
+    #[test]
+    fn older_forward_completion_does_not_close_a_new_picker() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.forward_draft = Some(ForwardDraft { account: "a".into(), source: peer, msg_id: 2, search: String::new(), request_id: Some(2) });
+        app.apply_event(Evt::ForwardResult { account: "a".into(), destination: peer, request_id: 1, result: Ok(None) });
+        assert_eq!(app.forward_draft.as_ref().unwrap().request_id, Some(2));
+        app.apply_event(Evt::ForwardResult { account: "a".into(), destination: peer, request_id: 2, result: Err("restricted".into()) });
+        assert!(app.forward_draft.is_some());
+        assert_eq!(app.forward_draft.as_ref().unwrap().request_id, None);
+        assert!(app.toast.as_ref().unwrap().0.contains("restricted"));
+    }
+
+    #[test]
     fn replacement_media_gets_a_distinct_cache_key() {
         let peer = PeerId::user(1);
         let old = media_cache_key("a", peer, 10, Some("p123"));
@@ -3883,8 +4291,9 @@ mod message_cache_tests {
         assert!(app.composer.contains('\n'));
         assert!(cmd_rx.try_recv().is_err());
         app.composer.push_str("world");
+        app.reply_draft = Some(ReplyDraft { account: "a".into(), peer_id: PeerId::user(1), msg_id: 33, preview: "original".into() });
         ctx.run_ui(egui::RawInput { focused: true, events: vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE), event(egui::Modifiers::NONE)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
-        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SendText { text, .. }) if text.contains('\n') && text.contains("world")));
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SendText { text, reply_to: Some(33), .. }) if text.contains('\n') && text.contains("world")));
         assert!(app.composer.is_empty());
     }
 

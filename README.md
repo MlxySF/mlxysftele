@@ -75,6 +75,11 @@ an OpenGL-capable system and graphics driver.
   minutes while online. Failed refreshes are retried and marked `sync !`.
   Switching accounts returns to the chat list so an old open chat is not marked
   read merely by selecting the account. Reopening a chat reloads its history.
+- **Reply, forward and react** — use the controls on a message to reply with
+  text or an attached photo, forward it to a chat in the same account, or add
+  and remove emoji reactions. The composer shows the reply target; messages
+  show available reply context, forwarded labels and reaction counts. Reaction
+  choices and forwarding remain subject to Telegram's chat restrictions.
 - **Message controls and sync** — use **Delete…** on a message and confirm
   **Delete for everyone**. Telegram enforces chat permissions and may reject a
   request; failures are shown and the message is kept. Live edits and deletions
