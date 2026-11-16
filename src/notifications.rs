@@ -19,6 +19,7 @@ pub struct Notifications {
     categories: HashMap<Key, Category>,
     peers: HashMap<Key, Setting>,
     defaults: HashMap<(String, Category), Setting>,
+    failed_accounts: HashSet<String>,
 }
 
 impl Notifications {
@@ -36,6 +37,7 @@ impl Notifications {
         self.defaults.insert(key, Setting { until, observed });
     }
     pub fn status(&self, account: &str, peer: PeerId, now: u64) -> MuteStatus {
+        if self.failed_accounts.contains(account) { return MuteStatus::Unknown; }
         let key = (account.to_owned(), peer);
         let Some(peer_setting) = self.peers.get(&key) else { return MuteStatus::Unknown };
         let effective = match peer_setting.until {
@@ -48,9 +50,11 @@ impl Notifications {
         };
         if i64::from(effective) > now.min(i64::MAX as u64) as i64 { MuteStatus::Muted } else { MuteStatus::Unmuted }
     }
-    pub fn all_defaults_known(&self, account: &str) -> bool {
-        [Category::User, Category::Group, Category::Broadcast]
-            .iter().all(|c| self.defaults.contains_key(&(account.to_owned(), *c)))
+    /// A failed refresh can leave known-looking settings stale. Do not trust
+    /// them for alarms until a complete refresh succeeds.
+    pub fn set_sync_failed(&mut self, account: &str, failed: bool) {
+        if failed { self.failed_accounts.insert(account.to_owned()); }
+        else { self.failed_accounts.remove(account); }
     }
     /// Reconsider timed mutes even when no new network/UI event arrives.
     pub fn next_expiry(&self, now: u64) -> Option<u64> {
@@ -64,6 +68,7 @@ impl Notifications {
         self.categories.retain(|(a, _), _| known.contains(a));
         self.peers.retain(|(a, _), _| known.contains(a));
         self.defaults.retain(|(a, _), _| known.contains(a));
+        self.failed_accounts.retain(|a| known.contains(a));
     }
 }
 
@@ -87,6 +92,17 @@ mod tests {
         n.set_peer("a", peer, Some(0), now); // stale snapshot must not undo an update
         assert_eq!(n.status("a", peer, 100), MuteStatus::Muted);
         assert_eq!(n.status("b", peer, 100), MuteStatus::Unknown);
+    }
+    #[test]
+    fn failed_refresh_makes_stale_settings_unknown_until_complete_success() {
+        let mut n = Notifications::default(); let peer = PeerId::user(1); let t = Instant::now();
+        n.set_peer("a", peer, Some(0), t);
+        n.set_peer("b", peer, Some(0), t);
+        n.set_sync_failed("a", true);
+        assert_eq!(n.status("a", peer, 1), MuteStatus::Unknown);
+        assert_eq!(n.status("b", peer, 1), MuteStatus::Unmuted);
+        n.set_sync_failed("a", false);
+        assert_eq!(n.status("a", peer, 1), MuteStatus::Unmuted);
     }
     #[test]
     fn default_updates_do_not_override_peer_exceptions() {

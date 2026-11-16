@@ -184,6 +184,7 @@ enum Evt {
     Dialogs { name: String, items: Vec<DialogItem>, observed: Instant },
     NotifyPeer { account: String, peer_id: PeerId, until: Option<i32>, observed: Instant },
     NotifySyncError { account: String, message: String },
+    NotifySyncComplete { account: String, successful: bool },
     NotifyDefault { account: String, category: Category, result: Result<Option<i32>, String>, observed: Instant },
     History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
     Incoming { account: String, peer_id: PeerId, msg: MsgItem },
@@ -645,6 +646,7 @@ impl Worker {
     async fn refresh_dialogs(&mut self, name: &str) {
         let Some(client) = self.conns.get(name).map(|conn| conn.client.clone()) else { return };
         // Per-chat settings can inherit one of these three account defaults.
+        let mut defaults_ok = true;
         for (category, peer) in [
             (Category::User, tl::enums::InputNotifyPeer::InputNotifyUsers),
             (Category::Group, tl::enums::InputNotifyPeer::InputNotifyChats),
@@ -653,6 +655,7 @@ impl Worker {
             let observed = Instant::now();
             let result = client.invoke(&tl::functions::account::GetNotifySettings { peer }).await
                 .map(|settings| notification_mute_until(&settings)).map_err(|e| e.to_string());
+            if result.is_err() { defaults_ok = false; }
             self.emit(Evt::NotifyDefault { account: name.to_owned(), category, result, observed });
         }
         let observed = Instant::now();
@@ -704,9 +707,11 @@ impl Worker {
             });
         }
         self.emit(Evt::Dialogs { name: name.to_string(), items, observed });
+        let successful = defaults_ok && dialog_error.is_none();
         if let Some(message) = dialog_error {
             self.emit(Evt::NotifySyncError { account: name.to_owned(), message });
         }
+        self.emit(Evt::NotifySyncComplete { account: name.to_owned(), successful });
     }
 
     async fn fetch_history(&mut self, account: &str, peer_id: PeerId) {
@@ -1436,16 +1441,23 @@ impl TelegramApp {
                 self.notifications.set_peer(&account, peer_id, until, observed);
             }
             Evt::NotifySyncError { account, message } => {
+                self.notifications.set_sync_failed(&account, true);
                 self.notify_retry.insert(account, Instant::now() + Duration::from_secs(30));
                 self.toast = Some((format!("Could not load chats; alarm may be delayed: {message}"), Instant::now()));
+            }
+            Evt::NotifySyncComplete { account, successful } => {
+                if successful {
+                    self.notifications.set_sync_failed(&account, false);
+                    self.notify_retry.remove(&account);
+                }
             }
             Evt::NotifyDefault { account, category, result, observed } => {
                 match result {
                     Ok(until) => {
                         self.notifications.set_default(&account, category, until, observed);
-                        if self.notifications.all_defaults_known(&account) { self.notify_retry.remove(&account); }
                     }
                     Err(error) => {
+                        self.notifications.set_sync_failed(&account, true);
                         self.notify_retry.insert(account, Instant::now() + Duration::from_secs(30));
                         self.toast = Some((format!("Could not load notification settings; alarm may be delayed: {error}"), Instant::now()));
                     }
@@ -3255,6 +3267,32 @@ mod message_cache_tests {
         assert_eq!(app.unread.newest(&key.0, peer), Some(11));
         app.apply_event(Evt::ReadUpdate { account: key.0.clone(), peer_id: peer, max_id: 11, remaining: 0 });
         assert!(!app.unread.any());
+    }
+
+    #[test]
+    fn mute_events_filter_alarms_but_keep_unread_and_failed_sync_retries() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1); let t = Instant::now();
+        app.unread.incoming("account", peer, 10);
+        app.apply_event(Evt::Dialogs { name: "account".into(), observed: t, items: vec![DialogItem {
+            peer_id: peer, name: "person".into(), preview: None, unread_count: 1,
+            top_message: 10, read_inbox_max_id: 0, category: Category::User, mute_until: Some(i32::MAX),
+        }] });
+        assert_eq!(app.unread.count("account", peer), 1);
+        assert!(!app.unread.any_alertable(&app.notifications, 100));
+        app.apply_event(Evt::NotifyPeer { account: "account".into(), peer_id: peer, until: Some(0), observed: t + Duration::from_secs(1) });
+        assert!(app.unread.any_alertable(&app.notifications, 100));
+        app.apply_event(Evt::NotifyDefault { account: "account".into(), category: Category::User, result: Err("offline".into()), observed: t });
+        app.apply_event(Evt::NotifyDefault { account: "account".into(), category: Category::Group, result: Ok(Some(0)), observed: t });
+        assert!(app.notify_retry.contains_key("account"));
+        assert!(!app.unread.any_alertable(&app.notifications, 100));
+        app.apply_event(Evt::NotifySyncComplete { account: "account".into(), successful: false });
+        assert!(app.notify_retry.contains_key("account"));
+        app.apply_event(Evt::NotifySyncComplete { account: "account".into(), successful: true });
+        assert!(!app.notify_retry.contains_key("account"));
+        assert!(app.unread.any_alertable(&app.notifications, 100));
     }
 
     #[test]
