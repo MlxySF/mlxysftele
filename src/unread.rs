@@ -136,6 +136,20 @@ mod tests {
     }
 
     #[test]
+    fn deleted_newest_waits_for_server_snapshot_without_reading_everything() {
+        let peer = PeerId::user(1);
+        let mut unread = Unread::default();
+        unread.snapshot("a", peer, 2, 12, 9);
+        unread.deleted_from_peer("a", peer, &[12]);
+        assert_eq!(unread.count("a", peer), 1);
+        assert_eq!(unread.newest("a", peer), None);
+        unread.snapshot("a", peer, 1, 11, 9);
+        assert_eq!(unread.newest("a", peer), Some(11));
+        unread.deleted_from_peer("a", peer, &[11]);
+        assert!(!unread.any());
+    }
+
+    #[test]
     fn old_ack_cannot_clear_newer_incoming_or_snapshot() {
         let p = PeerId::user(1); let mut u = Unread::default();
         u.snapshot("a", p, 1, 10, 9);

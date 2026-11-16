@@ -1390,6 +1390,7 @@ struct TelegramApp {
     sel_peer: HashMap<String, PeerId>,
     chats: HashMap<(String, PeerId), Vec<MsgItem>>,
     history_pending: HashMap<(String, PeerId), Vec<HistoryChange>>,
+    unread_refresh_after: HashMap<String, Instant>,
     confirm_delete: Option<(String, PeerId, i32)>,
     deleting: std::collections::HashSet<(String, PeerId, i32)>,
     unread: Unread,
@@ -1446,6 +1447,7 @@ impl TelegramApp {
             sel_peer: HashMap::new(),
             chats: HashMap::new(),
             history_pending: HashMap::new(),
+            unread_refresh_after: HashMap::new(),
             confirm_delete: None,
             deleting: std::collections::HashSet::new(),
             unread: Unread::default(),
@@ -1501,6 +1503,7 @@ impl TelegramApp {
                 self.last_auto_refresh.retain(|k, _| known.contains(k));
                 self.chats.retain(|(a, _), _| known.contains(a));
                 self.history_pending.retain(|(a, _), _| known.contains(a));
+                self.unread_refresh_after.retain(|a, _| known.contains(a));
                 self.deleting.retain(|(a, _, _)| known.contains(a));
                 if self.confirm_delete.as_ref().is_some_and(|(a, _, _)| !known.contains(a)) { self.confirm_delete = None; }
                 self.unread.retain_accounts(&known);
@@ -1543,7 +1546,11 @@ impl TelegramApp {
             }
             Evt::Dialogs { name, items, observed } => {
                 for dialog in &items {
-                    self.unread.snapshot(&name, dialog.peer_id, dialog.unread_count, dialog.top_message, dialog.read_inbox_max_id);
+                    // A pre-deletion dialog request must not restore a deleted
+                    // unread high watermark before the post-deletion refresh.
+                    if self.unread_refresh_after.get(&name).is_none_or(|cutoff| observed >= *cutoff) {
+                        self.unread.snapshot(&name, dialog.peer_id, dialog.unread_count, dialog.top_message, dialog.read_inbox_max_id);
+                    }
                     self.notifications.set_category(&name, dialog.peer_id, dialog.category);
                     self.notifications.set_peer(&name, dialog.peer_id, dialog.mute_until, observed);
                 }
@@ -1633,6 +1640,7 @@ impl TelegramApp {
                     }).cloned().collect();
                 for (_, peer) in keys { self.record_chat_change(&account, peer, HistoryChange::Delete(ids.clone())); }
                 self.unread.deleted(&account, channel, &ids);
+                self.unread_refresh_after.insert(account.clone(), Instant::now());
                 self.send_cmd(Cmd::RefreshDialogs { account });
             }
             Evt::DeleteResult { account, peer_id, msg_id, result } => {
@@ -1641,6 +1649,7 @@ impl TelegramApp {
                     Ok(()) => {
                         self.record_chat_change(&account, peer_id, HistoryChange::Delete(vec![msg_id]));
                         self.unread.deleted_from_peer(&account, peer_id, &[msg_id]);
+                        self.unread_refresh_after.insert(account.clone(), Instant::now());
                         self.send_cmd(Cmd::RefreshDialogs { account });
                     }
                     Err(e) => self.toast = Some((format!("Could not delete for everyone: {e}"), Instant::now())),
@@ -3474,6 +3483,24 @@ mod message_cache_tests {
         app.apply_event(Evt::HistoryFailed { account: "a".into(), peer_id: peer, message: "offline".into() });
         app.request_history("a".into(), peer);
         assert!(app.history_pending.contains_key(&key));
+    }
+
+    #[test]
+    fn stale_dialog_snapshot_cannot_restore_deleted_unread() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let old = Instant::now();
+        app.unread.snapshot("a", peer, 1, 10, 0);
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: None, ids: vec![10] });
+        let cutoff = app.unread_refresh_after["a"];
+        let item = |unread_count, top_message| DialogItem { peer_id: peer, name: "chat".into(), preview: None,
+            unread_count, top_message, read_inbox_max_id: 0, category: Category::User, mute_until: Some(0) };
+        app.apply_event(Evt::Dialogs { name: "a".into(), items: vec![item(1, 10)], observed: old - Duration::from_millis(1) });
+        assert!(!app.unread.any());
+        app.apply_event(Evt::Dialogs { name: "a".into(), items: vec![item(0, 9)], observed: cutoff + Duration::from_millis(1) });
+        assert!(!app.unread.any());
     }
 
     #[test]
