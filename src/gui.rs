@@ -66,6 +66,7 @@ enum Cmd {
     OpenChat { account: String, peer_id: PeerId },
     MarkRead { account: String, peer_id: PeerId, max_id: i32 },
     DeleteMessage { account: String, peer_id: PeerId, msg_id: i32 },
+    EditMessage { account: String, peer_id: PeerId, msg_id: i32, text: String, request_id: u64 },
     SendText { account: String, peer_id: PeerId, text: String, reply_to: Option<i32> },
     /// Send a local image file as a photo; `caption` may be empty.
     SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String, reply_to: Option<i32> },
@@ -143,10 +144,22 @@ struct SendDraft { text: String, attachment: Option<PathBuf>, reply_to: Option<i
 
 struct ForwardDraft { account: String, source: PeerId, msg_id: i32, search: String, request_id: Option<u64> }
 
+struct EditDraft {
+    account: String, peer_id: PeerId, msg_id: i32,
+    text: String, original: String, caption: bool, request_id: Option<u64>,
+    error: Option<String>, changed_remotely: bool,
+}
+
+fn can_edit_message(msg: &MsgItem) -> bool {
+    msg.outgoing && msg.forwarded.is_none()
+        && (msg.media.is_none() || matches!(msg.media, Some(MsgMedia::Photo | MsgMedia::Video(_))) || !msg.text.is_empty())
+}
+
 #[derive(Clone)]
 struct MsgItem {
     id: i32,
     outgoing: bool,
+    edited: bool,
     unix: i64,
     text: String,
     media: Option<MsgMedia>,
@@ -306,7 +319,7 @@ fn message_forwarded(message: &grammers_client::message::Message) -> Option<Stri
 
 fn message_item(message: &grammers_client::message::Message, media: &Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)>) -> MsgItem {
     MsgItem {
-        id: message.id(), outgoing: message.outgoing(), unix: message.date().timestamp(),
+        id: message.id(), outgoing: message.outgoing(), edited: message.edit_date().is_some(), unix: message.date().timestamp(),
         text: message.text().to_string(), media: media.as_ref().map(|(kind, _, _)| kind.clone()),
         media_token: split_media_token(media), reply: message_reply(message),
         forwarded: message_forwarded(message), reactions: message_reactions(message).0,
@@ -413,6 +426,7 @@ enum Evt {
     // Non-channel IDs are account-wide; Telegram does not include a peer.
     Deleted { account: String, channel: Option<PeerId>, ids: Vec<i32> },
     DeleteResult { account: String, peer_id: PeerId, msg_id: i32, result: Result<(), String> },
+    EditResult { account: String, peer_id: PeerId, msg_id: i32, request_id: u64, result: Result<(), String> },
     HistoryFailed { account: String, peer_id: PeerId, message: String },
     Reactions { account: String, peer_id: PeerId, msg_id: i32, reactions: Vec<ReactionItem>, minimal: bool },
     ReactionResult { account: String, peer_id: PeerId, msg_id: i32, observed: Instant, result: Result<Option<(Vec<ReactionItem>, bool)>, String> },
@@ -1071,6 +1085,14 @@ impl Worker {
         self.emit(Evt::DeleteResult { account: account.into(), peer_id, msg_id, result });
     }
 
+    async fn edit_message(&mut self, account: &str, peer_id: PeerId, msg_id: i32, text: String, request_id: u64) {
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            Some((client, peer)) => client.edit_message(peer, msg_id, text).await.map_err(|error| error.to_string()),
+            None => Err("account or chat is not connected".into()),
+        };
+        self.emit(Evt::EditResult { account: account.into(), peer_id, msg_id, request_id, result });
+    }
+
     async fn send_text(&mut self, account: &str, peer_id: PeerId, text: String, reply_to: Option<i32>) {
         let draft = SendDraft { text: text.clone(), attachment: None, reply_to };
         let Some(conn) = self.conns.get(account) else {
@@ -1499,6 +1521,7 @@ impl Worker {
                 Cmd::OpenChat { account, peer_id } => self.fetch_history(&account, peer_id).await,
                 Cmd::MarkRead { account, peer_id, max_id } => self.mark_read(&account, peer_id, max_id).await,
                 Cmd::DeleteMessage { account, peer_id, msg_id } => self.delete_message(&account, peer_id, msg_id).await,
+                Cmd::EditMessage { account, peer_id, msg_id, text, request_id } => self.edit_message(&account, peer_id, msg_id, text, request_id).await,
                 Cmd::SendText { account, peer_id, text, reply_to } => {
                     self.send_text(&account, peer_id, text, reply_to).await
                 }
@@ -1653,6 +1676,8 @@ struct TelegramApp {
     history_pending: HashMap<(String, PeerId), Vec<HistoryChange>>,
     history_reload_after: std::collections::HashSet<(String, PeerId)>,
     reply_draft: Option<ReplyDraft>,
+    edit_draft: Option<EditDraft>,
+    next_edit_id: u64,
     failed_sends: HashMap<(String, PeerId), Vec<SendDraft>>,
     forward_draft: Option<ForwardDraft>,
     next_forward_id: u64,
@@ -1721,6 +1746,8 @@ impl TelegramApp {
             history_pending: HashMap::new(),
             history_reload_after: std::collections::HashSet::new(),
             reply_draft: None,
+            edit_draft: None,
+            next_edit_id: 0,
             failed_sends: HashMap::new(),
             forward_draft: None,
             next_forward_id: 0,
@@ -1788,6 +1815,7 @@ impl TelegramApp {
                 self.pending_reactions.retain(|(a, _, _)| known.contains(a));
                 self.reaction_versions.retain(|(a, _, _), _| known.contains(a));
                 if self.reply_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.reply_draft = None; }
+                if self.edit_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.edit_draft = None; }
                 if self.forward_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.forward_draft = None; }
                 self.unread_refresh_after.retain(|a, _| known.contains(a));
                 self.deleting.retain(|(a, _, _)| known.contains(a));
@@ -1955,6 +1983,11 @@ impl TelegramApp {
                 self.request_dialog_refresh(&account);
             }
             Evt::Edited { account, peer_id, msg } => {
+                if let Some(draft) = &mut self.edit_draft {
+                    if draft.account == account && draft.peer_id == peer_id && draft.msg_id == msg.id && draft.request_id.is_none() && msg.text != draft.original {
+                        draft.changed_remotely = true;
+                    }
+                }
                 if self.dialogs.get(&account).is_some_and(|rows| rows.iter().any(|d| d.peer_id == peer_id && d.top_message == msg.id)) {
                     self.update_live_dialog(&account, peer_id, &msg, None);
                 }
@@ -1972,6 +2005,13 @@ impl TelegramApp {
                     }).cloned().collect();
                 for (_, peer) in keys { self.record_chat_change(&account, peer, HistoryChange::Delete(ids.clone())); }
                 self.unread.deleted(&account, channel, &ids);
+                if self.edit_draft.as_ref().is_some_and(|d| d.account == account && ids.contains(&d.msg_id) && match channel {
+                    Some(channel) => d.peer_id == channel,
+                    None => d.peer_id.kind() != PeerKind::Channel,
+                }) {
+                    self.edit_draft = None;
+                    self.toast = Some(("Message was deleted; edit closed".into(), Instant::now()));
+                }
                 if self.reply_draft.as_ref().is_some_and(|d| d.account == account && ids.contains(&d.msg_id) && match channel {
                     Some(channel) => d.peer_id == channel,
                     None => d.peer_id.kind() != PeerKind::Channel,
@@ -1994,12 +2034,32 @@ impl TelegramApp {
                         self.record_chat_change(&account, peer_id, HistoryChange::Delete(vec![msg_id]));
                         self.unread.deleted_from_peer(&account, peer_id, &[msg_id]);
                         if self.reply_draft.as_ref().is_some_and(|d| d.account == account && d.peer_id == peer_id && d.msg_id == msg_id) { self.reply_draft = None; }
+                        if self.edit_draft.as_ref().is_some_and(|d| d.account == account && d.peer_id == peer_id && d.msg_id == msg_id) { self.edit_draft = None; }
                         self.reaction_versions.remove(&(account.clone(), peer_id, msg_id));
                         self.unread_refresh_after.insert(account.clone(), Instant::now());
                         self.live_dialogs.remove(&(account.clone(), peer_id));
                         self.request_dialog_refresh(&account);
                     }
                     Err(e) => self.toast = Some((format!("Could not delete for everyone: {e}"), Instant::now())),
+                }
+            }
+            Evt::EditResult { account, peer_id, msg_id, request_id, result } => {
+                let matches = self.edit_draft.as_ref().is_some_and(|d| d.account == account && d.peer_id == peer_id && d.msg_id == msg_id && d.request_id == Some(request_id));
+                match result {
+                    Ok(()) => {
+                        if matches { self.edit_draft = None; }
+                        // The edit RPC can return updates without feeding our update stream.
+                        // Reconcile against Telegram rather than overwriting newer remote edits.
+                        let key = (account.clone(), peer_id);
+                        if self.history_pending.contains_key(&key) { self.history_reload_after.insert(key); }
+                        else { self.request_history(account.clone(), peer_id); }
+                        self.request_dialog_refresh(&account);
+                        self.toast = Some(("Message edited".into(), Instant::now()));
+                    }
+                    Err(error) => {
+                        if matches { if let Some(draft) = &mut self.edit_draft { draft.request_id = None; draft.error = Some(error.clone()); } }
+                        self.toast = Some((format!("Edit failed: {error}"), Instant::now()));
+                    }
                 }
             }
             Evt::Reactions { account, peer_id, msg_id, reactions, minimal } => {
@@ -2510,6 +2570,10 @@ impl eframe::App for TelegramApp {
         if esc {
             if self.confirm_delete.take().is_some() {
                 // deletion cancelled
+            } else if self.edit_draft.as_ref().is_some_and(|draft| draft.request_id.is_none()) {
+                self.edit_draft = None;
+            } else if self.edit_draft.is_some() {
+                // An already submitted edit cannot be cancelled.
             } else if self.forward_draft.take().is_some() {
                 // forward picker closed (an already sent request may still complete)
             } else if self.viewer.take().is_some() {
@@ -2588,6 +2652,7 @@ impl eframe::App for TelegramApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
+        self.ui_edit_window(ui.ctx());
         self.ui_forward_window(ui.ctx());
         self.ui_delete_confirmation(ui.ctx());
         self.ui_settings_window(ui.ctx());
@@ -3222,7 +3287,14 @@ impl TelegramApp {
                         });
                     }
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(format_msg_time(message.unix)).small().color(time_color));
+                        let timestamp = if message.edited { format!("edited {}", format_msg_time(message.unix)) } else { format_msg_time(message.unix) };
+                        ui.label(egui::RichText::new(timestamp).small().color(time_color));
+                        if can_edit_message(message) && ui.add_enabled(self.edit_draft.is_none(), egui::Button::new("Edit").small())
+                            .on_hover_text("Edit this message on Telegram").clicked() {
+                            self.edit_draft = Some(EditDraft { account: account.to_owned(), peer_id, msg_id: message.id,
+                                text: message.text.clone(), original: message.text.clone(), caption: message.media.is_some(),
+                                request_id: None, error: None, changed_remotely: false });
+                        }
                         if ui.small_button("Reply").clicked() {
                             self.reply_draft = Some(ReplyDraft { account: account.to_owned(), peer_id, msg_id: message.id, preview: preview_text(message) });
                             self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
@@ -3264,6 +3336,38 @@ impl TelegramApp {
         if let Some((account, peer_id, msg_id, cache_key)) = open_video {
             self.send_cmd(Cmd::OpenVideo { account, peer_id, msg_id, cache_key });
         }
+    }
+
+    fn queue_edit(&mut self, draft: &mut EditDraft) {
+        if draft.request_id.is_some() || (!draft.caption && draft.text.trim().is_empty()) || draft.text == draft.original { return; }
+        self.next_edit_id = self.next_edit_id.wrapping_add(1);
+        let request_id = self.next_edit_id;
+        let command = Cmd::EditMessage { account: draft.account.clone(), peer_id: draft.peer_id, msg_id: draft.msg_id,
+            text: draft.text.clone(), request_id };
+        if self.cmd_tx.send(command).is_ok() { draft.request_id = Some(request_id); draft.error = None; }
+        else { draft.error = Some("worker stopped".into()); }
+    }
+
+    fn ui_edit_window(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.edit_draft.take() else { return };
+        let mut close = false;
+        egui::Window::new(if draft.caption { "Edit caption" } else { "Edit message" })
+            .collapsible(false).resizable(true).default_width(400.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Account: {}", draft.account));
+                ui.label(egui::RichText::new("Editing sends plain text; existing formatting will be removed. Telegram may reject edits due to permissions or time limits.").weak().small());
+                if draft.changed_remotely { ui.colored_label(egui::Color32::YELLOW, "This message changed on another device. Saving will overwrite that edit."); }
+                ui.add_enabled(draft.request_id.is_none(), egui::TextEdit::multiline(&mut draft.text).desired_rows(5).desired_width(f32::INFINITY));
+                if let Some(error) = &draft.error { ui.colored_label(egui::Color32::LIGHT_RED, format!("Edit failed: {error}")); }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(draft.request_id.is_none(), egui::Button::new("Cancel")).clicked() { close = true; }
+                    let valid = draft.request_id.is_none() && draft.text != draft.original && (draft.caption || !draft.text.trim().is_empty());
+                    if ui.add_enabled(valid, egui::Button::new("Save edit")).clicked() { self.queue_edit(&mut draft); }
+                    if draft.request_id.is_some() { ui.spinner(); ui.label("Saving…"); }
+                });
+            });
+        if !close { self.edit_draft = Some(draft); }
     }
 
     fn queue_forward(&mut self, draft: &mut ForwardDraft, destination: PeerId) {
@@ -4098,7 +4202,7 @@ mod message_cache_tests {
     use super::*;
 
     fn photo(id: i32, text: &str) -> MsgItem {
-        MsgItem { id, outgoing: true, unix: 1, text: text.into(), media: Some(MsgMedia::Photo), media_token: None, reply: None, forwarded: None, reactions: vec![] }
+        MsgItem { id, outgoing: true, edited: false, unix: 1, text: text.into(), media: Some(MsgMedia::Photo), media_token: None, reply: None, forwarded: None, reactions: vec![] }
     }
 
     fn dialog(peer_id: PeerId, name: &str, top: i32, pinned: bool) -> DialogItem {
@@ -4215,6 +4319,82 @@ mod message_cache_tests {
         ctx.run_ui(egui::RawInput { focused: true, ..Default::default() }, |ui| app.mark_visible_chat_read(ui.ctx())).drop_without_applying_deltas();
         assert!(cmd_rx.try_recv().is_err());
         assert_eq!(app.unread.count("a", peer), 1);
+    }
+
+    fn edit_draft(account: &str, peer_id: PeerId, msg_id: i32, caption: bool) -> EditDraft {
+        EditDraft { account: account.into(), peer_id, msg_id, text: "changed".into(), original: "original".into(),
+            caption, request_id: None, error: None, changed_remotely: false }
+    }
+
+    #[test]
+    fn edit_targets_own_non_forwarded_messages_and_photo_captions() {
+        let mut msg = photo(5, "caption");
+        assert!(can_edit_message(&msg));
+        msg.text.clear(); assert!(can_edit_message(&msg));
+        msg.outgoing = false; assert!(!can_edit_message(&msg));
+        msg.outgoing = true; msg.forwarded = Some(String::new()); assert!(!can_edit_message(&msg));
+        msg.forwarded = None; msg.media = None; assert!(can_edit_message(&msg));
+        msg.media = Some(MsgMedia::Label("sticker".into())); assert!(!can_edit_message(&msg));
+    }
+
+    #[test]
+    fn edits_are_scoped_and_failure_preserves_draft_success_reloads_history() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::channel(1);
+        let mut draft = edit_draft("a", peer, 9, true);
+        app.queue_edit(&mut draft);
+        app.queue_edit(&mut draft);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::EditMessage { account, peer_id, msg_id: 9, text, request_id: 1 })
+            if account == "a" && peer_id == peer && text == "changed"));
+        assert!(cmd_rx.try_recv().is_err());
+        app.edit_draft = Some(draft);
+        app.apply_event(Evt::EditResult { account: "a".into(), peer_id: peer, msg_id: 9, request_id: 1, result: Err("not allowed".into()) });
+        assert_eq!(app.edit_draft.as_ref().unwrap().text, "changed");
+        assert_eq!(app.edit_draft.as_ref().unwrap().error.as_deref(), Some("not allowed"));
+        let mut draft = app.edit_draft.take().unwrap();
+        draft.text.clear(); // captions can be removed
+        app.queue_edit(&mut draft);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::EditMessage { text, request_id: 2, .. }) if text.is_empty()));
+        app.edit_draft = Some(draft);
+        app.request_history("a".into(), peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        app.apply_event(Evt::EditResult { account: "a".into(), peer_id: peer, msg_id: 9, request_id: 2, result: Ok(()) });
+        assert!(app.edit_draft.is_none());
+        assert!(app.history_reload_after.contains(&(String::from("a"), peer)));
+        app.apply_event(Evt::History { account: "a".into(), peer_id: peer, messages: vec![photo(9, "stale")] });
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+    }
+
+    #[test]
+    fn edits_refuse_empty_text_warn_about_remote_changes_and_handle_deletions() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::channel(1); let other = PeerId::channel(2);
+        let mut draft = edit_draft("a", peer, 9, false);
+        draft.text = "  ".into(); app.queue_edit(&mut draft); assert!(cmd_rx.try_recv().is_err());
+        app.edit_draft = Some(draft);
+        app.apply_event(Evt::Edited { account: "a".into(), peer_id: other, msg: photo(9, "different chat") });
+        assert!(!app.edit_draft.as_ref().unwrap().changed_remotely);
+        app.apply_event(Evt::Edited { account: "a".into(), peer_id: peer, msg: photo(9, "remote") });
+        assert!(app.edit_draft.as_ref().unwrap().changed_remotely);
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: Some(other), ids: vec![9] });
+        assert!(app.edit_draft.is_some());
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: Some(peer), ids: vec![9] });
+        assert!(app.edit_draft.is_none());
+    }
+
+    #[test]
+    fn late_edit_response_cannot_close_a_different_editor() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.edit_draft = Some(edit_draft("a", peer, 10, false));
+        app.apply_event(Evt::EditResult { account: "a".into(), peer_id: peer, msg_id: 9, request_id: 1, result: Ok(()) });
+        assert_eq!(app.edit_draft.as_ref().unwrap().msg_id, 10);
     }
 
     #[test]

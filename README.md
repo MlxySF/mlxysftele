@@ -80,6 +80,11 @@ an OpenGL-capable system and graphics driver.
   and remove emoji reactions. The composer shows the reply target; messages
   show available reply context, forwarded labels and reaction counts. Reaction
   choices and forwarding remain subject to Telegram's chat restrictions.
+- **Edit sent messages** — use **Edit** on your own text messages or captions,
+  change the text and select **Save edit**. Edits are sent to Telegram and the
+  chat is reloaded; Telegram decides whether an edit is allowed. Failed edits
+  stay in the editor for retry. Edits currently send plain text and remove any
+  existing formatting; forwarded messages are not editable.
 - **Message controls and sync** — use **Delete…** on a message and confirm
   **Delete for everyone**. Telegram enforces chat permissions and may reject a
   request; failures are shown and the message is kept. Live edits and deletions
