@@ -87,7 +87,9 @@ an OpenGL-capable system and graphics driver.
   `<data_dir>/cache/media/` like photos.
 - **Repeated unread alarm** — three loud beeps repeat every 1.5 seconds while
   an unmuted chat has unread messages, including while the window is minimized.
-  Muted chats retain their unread counts in grey but do not trigger the alarm.
+  Use **Alarm: ON/OFF** in the top bar to enable or disable it for all accounts;
+  the choice is saved across restarts. Switching it off stops the current alarm
+  without changing unread counts or Telegram mute settings. Muted chats retain their unread counts in grey but do not trigger the alarm.
   Telegram's per-chat and account-wide mute settings are used; timed mutes expire
   automatically. Unknown settings show “checking…” and do not sound until loaded;
   failed sync is displayed and retried. Individual forum-topic overrides are not

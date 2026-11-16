@@ -77,6 +77,7 @@ enum Cmd {
     RemoveLocal { name: String },
     /// Flip a local premium flag (`None` = master switch).
     SetLocalPremium { flag: Option<String>, on: bool },
+    SetAlarmEnabled { enabled: bool, request_id: u64 },
 }
 
 #[derive(Clone)]
@@ -185,6 +186,7 @@ enum Evt {
     NotifyPeer { account: String, peer_id: PeerId, until: Option<i32>, observed: Instant },
     NotifySyncError { account: String, message: String },
     NotifySyncComplete { account: String, successful: bool },
+    AlarmSettingSaved { request_id: u64, result: Result<(), String> },
     NotifyDefault { account: String, category: Category, result: Result<Option<i32>, String>, observed: Instant },
     History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
     Incoming { account: String, peer_id: PeerId, msg: MsgItem },
@@ -1129,6 +1131,14 @@ impl Worker {
         self.broadcast_config();
     }
 
+    fn set_alarm_enabled(&mut self, enabled: bool, request_id: u64) {
+        // Keep the new setting in memory even if saving fails: a user who
+        // switched the alarm off must not have it unexpectedly restart.
+        self.cfg.alarm_enabled = enabled;
+        let result = self.cfg.save(&self.data_dir).map_err(|e| e.to_string());
+        self.emit(Evt::AlarmSettingSaved { request_id, result });
+    }
+
     fn save_creds(&mut self, api_id: i32, api_hash: String) {
         self.cfg.api_id = Some(api_id);
         self.cfg.api_hash = Some(api_hash);
@@ -1189,6 +1199,7 @@ impl Worker {
                 Cmd::Logout { name } => self.logout(name).await,
                 Cmd::RemoveLocal { name } => self.remove_local(name),
                 Cmd::SetLocalPremium { flag, on } => self.set_local_premium(flag, on),
+                Cmd::SetAlarmEnabled { enabled, request_id } => self.set_alarm_enabled(enabled, request_id),
             }
         }
     }
@@ -1318,6 +1329,10 @@ struct TelegramApp {
     pending_reads: HashMap<(String, PeerId), i32>,
     last_read_attempt: HashMap<(String, PeerId), Instant>,
     alarm: Alarm,
+    alarm_enabled: bool,
+    alarm_request_id: u64,
+    pending_alarm_request: Option<u64>,
+    alarm_save_error: Option<String>,
     alarm_errors: std_mpsc::Receiver<String>,
     composer: String,
     toast: Option<(String, Instant)>,
@@ -1340,6 +1355,7 @@ impl TelegramApp {
         show_add: bool,
         ctx: egui::Context,
     ) -> Self {
+        let alarm_enabled = cfg.alarm_enabled;
         let api_id_draft = cfg.api_id.map(|id| id.to_string()).unwrap_or_default();
         let api_hash_draft = cfg.api_hash.clone().unwrap_or_default();
         let (alarm_tx, alarm_errors) = std_mpsc::channel();
@@ -1366,6 +1382,10 @@ impl TelegramApp {
             pending_reads: HashMap::new(),
             last_read_attempt: HashMap::new(),
             alarm,
+            alarm_enabled,
+            alarm_request_id: 0,
+            pending_alarm_request: None,
+            alarm_save_error: None,
             alarm_errors,
             composer: String::new(),
             toast: None,
@@ -1421,7 +1441,24 @@ impl TelegramApp {
                 for account in &cfg.accounts {
                     self.status.entry(account.name.clone()).or_insert(ConnStatus::Connecting);
                 }
+                if self.pending_alarm_request.is_none() {
+                    self.alarm_enabled = cfg.alarm_enabled;
+                }
                 self.cfg = cfg;
+            }
+            Evt::AlarmSettingSaved { request_id, result } => {
+                // Ignore replies from older rapid toggles.
+                if self.pending_alarm_request == Some(request_id) {
+                    self.pending_alarm_request = None;
+                    self.cfg.alarm_enabled = self.alarm_enabled;
+                    match result {
+                        Ok(()) => self.alarm_save_error = None,
+                        Err(error) => {
+                            self.alarm_save_error = Some(error.clone());
+                            self.toast = Some((format!("Alarm setting applies to this session but could not be saved: {error}"), Instant::now()));
+                        }
+                    }
+                }
             }
             Evt::Status { name, status } => {
                 self.status.insert(name, status);
@@ -1615,6 +1652,27 @@ impl TelegramApp {
         let _ = self.cmd_tx.send(cmd);
     }
 
+    /// Apply the global switch immediately; persist it through the worker's
+    /// single-writer config path without delaying the audio stop/start.
+    fn set_alarm_enabled(&mut self, enabled: bool) {
+        self.alarm_enabled = enabled;
+        self.sync_alarm();
+        self.alarm_request_id = self.alarm_request_id.wrapping_add(1);
+        let request_id = self.alarm_request_id;
+        self.pending_alarm_request = Some(request_id);
+        if self.cmd_tx.send(Cmd::SetAlarmEnabled { enabled, request_id }).is_err() {
+            self.pending_alarm_request = None;
+            self.cfg.alarm_enabled = enabled;
+            self.alarm_save_error = Some("worker stopped".into());
+            self.toast = Some(("Alarm setting changed for this session, but could not be saved (worker stopped)".into(), Instant::now()));
+        }
+    }
+
+    fn sync_alarm(&mut self) {
+        let active = self.alarm_enabled && self.unread.any_alertable(&self.notifications, util::now_unix());
+        self.alarm.set_active(active);
+    }
+
     /// Decode an image file into the texture cache (no-op if already cached).
     fn decode_into_textures(&mut self, key: &str, path: &std::path::Path) -> bool {
         if self.textures.contains_key(key) {
@@ -1796,7 +1854,7 @@ impl eframe::App for TelegramApp {
         }
         self.mark_visible_chat_read(ctx);
         let now = util::now_unix();
-        self.alarm.set_active(self.unread.any_alertable(&self.notifications, now));
+        self.sync_alarm();
         if let Some(expiry) = self.notifications.next_expiry(now) {
             ctx.request_repaint_after(Duration::from_secs((expiry - now).clamp(1, 3600)));
         }
@@ -1938,13 +1996,27 @@ impl TelegramApp {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("mlxysftele").strong().size(16.0));
-                    ui.label(egui::RichText::new("ZapFast-style · native multi-account Telegram").weak().small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Settings").clicked() {
                             self.show_settings = true;
                         }
                         if ui.button("+ Add account").clicked() {
                             self.show_add = true;
+                        }
+                        let (label, fill, tip) = if self.alarm_enabled {
+                            ("Alarm: ON", egui::Color32::from_rgb(33, 105, 76), "Turn off the unread alarm for all accounts")
+                        } else {
+                            ("Alarm: OFF", egui::Color32::from_rgb(100, 70, 65), "Turn on the unread alarm for all accounts")
+                        };
+                        if ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(fill))
+                            .on_hover_text(tip).clicked() {
+                            self.set_alarm_enabled(!self.alarm_enabled);
+                        }
+                        if self.pending_alarm_request.is_some() {
+                            ui.label(egui::RichText::new("saving…").small().weak());
+                        } else if let Some(error) = &self.alarm_save_error {
+                            ui.colored_label(egui::Color32::from_rgb(255, 176, 46), "Alarm not saved")
+                                .on_hover_text(format!("This choice may reset on restart: {error}"));
                         }
                         let total = self.cfg.accounts.len();
                         let online = self
@@ -3320,6 +3392,72 @@ mod message_cache_tests {
         app.apply_event(Evt::ReadResult { account: "account".into(), peer_id: peer, max_id: 7, result: Err("offline".into()) });
         assert!(app.unread.any());
         assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn global_alarm_toggle_stops_and_resumes_without_losing_unread() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test();
+        let peer = PeerId::user(1);
+        let now = Instant::now();
+        for account in ["one", "two"] {
+            app.unread.incoming(account, peer, 10);
+            app.notifications.set_peer(account, peer, Some(0), now);
+        }
+        app.sync_alarm();
+        assert!(app.alarm.is_active());
+        app.set_alarm_enabled(false);
+        assert!(!app.alarm.is_active());
+        assert_eq!(app.unread.count("one", peer), 1);
+        assert_eq!(app.unread.count("two", peer), 1);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetAlarmEnabled { enabled: false, request_id: 1 })));
+
+        // An unrelated old worker configuration must not undo the immediate UI choice.
+        app.apply_event(Evt::Config(Config::default()));
+        assert!(!app.alarm_enabled);
+        app.set_alarm_enabled(true);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetAlarmEnabled { enabled: true, request_id: 2 })));
+        // Re-add unread entries because the config event above had no accounts.
+        app.unread.incoming("one", peer, 11);
+        app.notifications.set_peer("one", peer, Some(0), now);
+        app.sync_alarm();
+        assert!(app.alarm.is_active());
+        app.apply_event(Evt::AlarmSettingSaved { request_id: 1, result: Ok(()) });
+        assert!(app.alarm_enabled);
+        assert_eq!(app.pending_alarm_request, Some(2));
+        app.apply_event(Evt::AlarmSettingSaved { request_id: 2, result: Ok(()) });
+        assert_eq!(app.pending_alarm_request, None);
+        assert!(app.cfg.alarm_enabled);
+    }
+
+    #[test]
+    fn failed_alarm_save_keeps_current_session_choice_and_warns() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test();
+        app.set_alarm_enabled(false);
+        app.apply_event(Evt::AlarmSettingSaved { request_id: 1, result: Err("read-only".into()) });
+        assert!(!app.alarm_enabled);
+        assert!(!app.cfg.alarm_enabled);
+        assert!(!app.alarm.is_active());
+        assert!(app.toast.as_ref().unwrap().0.contains("could not be saved"));
+        assert!(app.alarm_save_error.is_some());
+    }
+
+    #[test]
+    fn worker_persists_global_alarm_choice() {
+        let dir = std::env::temp_dir().join(format!("mlxysftele-alarm-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let (evt_tx, evt_rx) = std_mpsc::channel();
+        let mut worker = Worker { data_dir: dir.clone(), cfg: Config::default(), evt_tx, ctx: egui::Context::default(),
+            conns: HashMap::new(), pending_logins: HashMap::new(), media_objects: HashMap::new() };
+        worker.set_alarm_enabled(false, 7);
+        assert!(!Config::load(&dir).unwrap().alarm_enabled);
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::AlarmSettingSaved { request_id: 7, result: Ok(()) })));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

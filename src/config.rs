@@ -42,6 +42,8 @@ pub struct Config {
     pub accounts: Vec<AccountMeta>,
     /// Local premium conveniences (see premium.rs / docs/LOCAL_PREMIUM.md).
     pub local_premium: PremiumToggles,
+    /// Global alert switch, independent of Telegram's per-chat mute settings.
+    pub alarm_enabled: bool,
 }
 
 impl Default for Config {
@@ -51,6 +53,7 @@ impl Default for Config {
             api_hash: None,
             accounts: Vec::new(),
             local_premium: PremiumToggles::default(),
+            alarm_enabled: true,
         }
     }
 }
@@ -195,12 +198,14 @@ mod tests {
         cfg.api_hash = Some("deadbeef".to_string());
         cfg.accounts.push(sample_account("work"));
         cfg.local_premium.enabled = true;
+        cfg.alarm_enabled = false;
         let text = serde_json::to_string_pretty(&cfg).expect("serialize");
         let back: Config = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back.api_id, Some(123456));
         assert_eq!(back.accounts.len(), 1);
         assert_eq!(back.accounts[0].name, "work");
         assert!(back.local_premium.enabled);
+        assert!(!back.alarm_enabled);
     }
 
     #[test]
@@ -210,6 +215,7 @@ mod tests {
                 .expect("tolerant parse");
         assert!(cfg.accounts.is_empty());
         assert_eq!(cfg.api_id, None);
+        assert!(cfg.alarm_enabled); // existing configs default to enabled
     }
 
     #[test]

@@ -26,6 +26,16 @@ impl Alarm {
         Self { tx, active: false }
     }
 
+    #[cfg(test)]
+    pub fn silent_for_test() -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || while rx.recv().is_ok() {});
+        Self { tx, active: false }
+    }
+
+    #[cfg(test)]
+    pub fn is_active(&self) -> bool { self.active }
+
     pub fn set_active(&mut self, active: bool) {
         if self.active != active {
             self.active = active;
