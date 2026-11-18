@@ -1,0 +1,20 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Local session data — never commit credentials
+*.session
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.mlxysftele/
+
+# App data dirs
+downloads/
+data/
+
+# Misc
+*.log
+.idea/
+.vscode/
+.DS_Store

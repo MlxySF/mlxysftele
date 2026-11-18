@@ -1,0 +1,5150 @@
+//! Native egui GUI — the primary interface of mlxysftele.
+//!
+//! Architecture
+//! ============
+//! * egui (via eframe) runs on the main thread.
+//! * All MTProto traffic lives on a dedicated background thread with its own
+//!   multi-thread tokio runtime, behind an `UnboundedReceiver<Cmd>`.
+//! * Events flow back over a std mpsc channel; the worker calls
+//!   [`egui::Context::request_repaint`] after every event so the UI reacts
+//!   instantly without any busy polling.
+//! * **Every enabled account keeps a live connection for the lifetime of
+//!   the process**, unless manually disabled in Settings. There is no lazy connect, no
+//!   idle reaper, no hot-set here; that was the superseded headless daemon
+//!   model. An account that fails to authenticate is shown as signed-out in
+//!   the sidebar instead of being dropped.
+//!
+//! RAM note: chat history is capped at [`MAX_CACHED_MESSAGES`] per dialog and
+//! history per dialog — a client that renders everything it has ever seen
+//! would not be ZapFast-style.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+
+use grammers_client::client::{LoginToken, PasswordToken, UpdatesConfiguration};
+use grammers_client::client::SignInError;
+use grammers_client::update::Update;
+use grammers_session::types::PeerId;
+use grammers_session::types::PeerRef;
+use grammers_client::Client;
+use grammers_tl_types as tl;
+
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use crate::alarm::Alarm;
+use crate::unread::Unread;
+use crate::notifications::{Category, MuteStatus, Notifications};
+use crate::config::{AccountMeta, Config};
+use crate::premium::{self, PremiumToggles};
+use crate::telegram;
+use crate::video::VideoPlayer;
+use crate::util;
+use crate::{log_err, log_warn};
+
+/// Cap for cached messages per open dialog.
+const MAX_CACHED_MESSAGES: usize = 100;
+/// Messages fetched when a dialog is opened.
+const HISTORY_PAGE: usize = 40;
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+const REFRESH_RETRY: Duration = Duration::from_secs(30);
+const PERIODIC_REFRESH: Duration = Duration::from_secs(120);
+
+// ---------------------------------------------------------------------------
+// Commands (GUI -> worker) and events (worker -> GUI)
+// ---------------------------------------------------------------------------
+
+enum Cmd {
+    /// Save Telegram API credentials; afterwards any account without a live
+    /// connection gets one.
+    SaveCreds { api_id: i32, api_hash: String },
+    RefreshDialogs { account: String, request_id: u64 },
+    StashPeer { account: String, peer: PeerRef },
+    OpenChat { account: String, peer_id: PeerId },
+    MarkRead { account: String, peer_id: PeerId, max_id: i32 },
+    DeleteMessage { account: String, peer_id: PeerId, msg_id: i32 },
+    EditMessage { account: String, peer_id: PeerId, msg_id: i32, text: String, request_id: u64 },
+    SendText { account: String, peer_id: PeerId, text: String, reply_to: Option<i32> },
+    /// Send a local image file as a photo; `caption` may be empty.
+    SendPhoto { account: String, peer_id: PeerId, path: PathBuf, caption: String, reply_to: Option<i32> },
+    ForwardMessage { account: String, source: PeerId, destination: PeerId, msg_id: i32, request_id: u64 },
+    React { account: String, peer_id: PeerId, msg_id: i32, reactions: Vec<ReactionKind> },
+    /// Download a video message for inline playback (user-tapped; never automatic).
+    OpenVideo { account: String, peer_id: PeerId, msg_id: i32, cache_key: String },
+    /// GUI → worker echo of `Evt::StashMedia`; stashes the raw Media handle.
+    StashMedia { cache_key: String, media: grammers_client::media::Media },
+    BeginLogin { name: String, phone: String },
+    SubmitCode { name: String, code: String },
+    SubmitPassword { name: String, password: String },
+    /// Sign out on Telegram (best effort) and wipe local session + registry entry.
+    Logout { name: String },
+    /// Wipe local session + registry entry only.
+    RemoveLocal { name: String },
+    /// Flip a local premium flag (`None` = master switch).
+    SetLocalPremium { flag: Option<String>, on: bool },
+    SetAlarmEnabled { enabled: bool, request_id: u64 },
+    SetAccountAlarm { name: String, enabled: bool, request_id: u64 },
+    SetAccountEnabled { name: String, enabled: bool, request_id: u64 },
+}
+
+#[derive(Clone)]
+struct DialogItem {
+    peer_id: PeerId,
+    name: String,
+    preview: Option<String>,
+    unread_count: u32,
+    top_message: i32,
+    read_inbox_max_id: i32,
+    category: Category,
+    mute_until: Option<i32>,
+    pinned: bool,
+    resolved: bool,
+}
+
+#[derive(Clone)]
+struct LiveDialog { msg: MsgItem, observed: Instant, name: Option<String> }
+
+#[derive(Default)]
+struct DialogRefresh {
+    pending: Option<u64>,
+    dirty: bool,
+    last_request: Option<Instant>,
+    last_success: Option<Instant>,
+    retry_at: Option<Instant>,
+    failed: bool,
+}
+
+/// Media carried by a chat message.
+#[derive(Clone)]
+enum MsgMedia {
+    /// An image Telegram gave us (photo / image document / webp sticker);
+    /// downloaded to the local cache for inline rendering.
+    Photo,
+    /// A video document; tapped to download & play inline (embedded libmpv).
+    Video(String),
+    /// Anything else — rendered as a muted caption label.
+    Label(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReactionKind { Emoji(String), Custom(i64), Paid }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReactionItem { kind: ReactionKind, count: i32, chosen: bool }
+
+#[derive(Clone)]
+struct ReplyRef { id: i32, peer: Option<PeerId>, quote: Option<String> }
+
+#[derive(Clone)]
+struct ReplyDraft { account: String, peer_id: PeerId, msg_id: i32, preview: String }
+
+#[derive(Clone)]
+struct SendDraft { text: String, attachment: Option<PathBuf>, reply_to: Option<i32> }
+
+struct ForwardDraft { account: String, source: PeerId, msg_id: i32, search: String, request_id: Option<u64> }
+
+struct EditDraft {
+    account: String, peer_id: PeerId, msg_id: i32,
+    text: String, original: String, caption: bool, request_id: Option<u64>,
+    error: Option<String>, changed_remotely: bool,
+}
+
+fn can_edit_message(msg: &MsgItem) -> bool {
+    msg.outgoing && msg.forwarded.is_none()
+        && (msg.media.is_none() || matches!(msg.media, Some(MsgMedia::Photo | MsgMedia::Video(_))) || !msg.text.is_empty())
+}
+
+#[derive(Clone)]
+struct MsgItem {
+    id: i32,
+    outgoing: bool,
+    edited: bool,
+    unix: i64,
+    text: String,
+    media: Option<MsgMedia>,
+    /// Telegram's media identity changes when the attachment is replaced.
+    media_token: Option<String>,
+    reply: Option<ReplyRef>,
+    forwarded: Option<String>,
+    reactions: Vec<ReactionItem>,
+}
+
+/// Update the visible row immediately; server snapshots later restore the
+/// authoritative order, name, pin and notification settings.
+fn update_dialog_row(rows: &mut Vec<DialogItem>, peer_id: PeerId, msg: &MsgItem, name: Option<&str>, fallback: Option<DialogItem>) {
+    let index = rows.iter().position(|d| d.peer_id == peer_id);
+    let mut row = index.map(|i| rows.remove(i)).or(fallback).unwrap_or_else(|| DialogItem {
+        peer_id, name: name.map(str::to_owned).unwrap_or_else(|| format!("Chat {peer_id} (loading…)")),
+        preview: None, unread_count: 0, top_message: 0, read_inbox_max_id: 0,
+        category: match peer_id.kind() {
+            grammers_session::types::PeerKind::Channel => Category::Broadcast,
+            grammers_session::types::PeerKind::Chat => Category::Group,
+            _ => Category::User,
+        },
+        mute_until: None, pinned: false, resolved: false,
+    });
+    if msg.id >= row.top_message {
+        row.top_message = msg.id;
+        let preview = msg.text.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ");
+        row.preview = if !preview.is_empty() { Some(truncate(&preview, 80)) } else {
+            msg.media.as_ref().map(|media| match media {
+                MsgMedia::Photo => "[photo]".to_owned(),
+                MsgMedia::Video(_) => "[video]".to_owned(),
+                MsgMedia::Label(label) => format!("[{label}]"),
+            })
+        };
+    }
+    // Preserve server-pinned ordering; move only unpinned conversations.
+    let at = if row.pinned { index.unwrap_or(0).min(rows.len()) }
+        else { rows.iter().take_while(|d| d.pinned).count() };
+    rows.insert(at, row);
+}
+
+/// Insert or refresh a message in one account's chat. Telegram can deliver
+/// the same message through both the send response and the live update stream.
+/// IDs are only compared within this chat, not across accounts or peers.
+/// Returns true only when this is a new message in the cache.
+fn upsert_chat_message(chat: &mut Vec<MsgItem>, msg: MsgItem) -> bool {
+    if let Some(existing) = chat.iter_mut().find(|existing| existing.id == msg.id) {
+        let mut msg = msg;
+        // A duplicate new-message/send response can predate a reaction update.
+        if msg.reactions.is_empty() && !existing.reactions.is_empty() {
+            msg.reactions = existing.reactions.clone();
+        }
+        *existing = msg;
+        return false;
+    }
+    chat.push(msg);
+    chat.sort_by_key(|message| message.id);
+    if chat.len() > MAX_CACHED_MESSAGES {
+        let excess = chat.len() - MAX_CACHED_MESSAGES;
+        chat.drain(..excess);
+    }
+    true
+}
+
+/// Changes observed while a history request is in flight, replayed over the
+/// response so an older snapshot cannot undo a live update.
+#[derive(Clone)]
+enum HistoryChange {
+    New(MsgItem),
+    Edit(MsgItem),
+    Delete(Vec<i32>),
+    Reactions { msg_id: i32, reactions: Vec<ReactionItem>, minimal: bool },
+}
+
+fn apply_history_change(chat: &mut Vec<MsgItem>, change: &HistoryChange) {
+    match change {
+        HistoryChange::New(msg) => { upsert_chat_message(chat, msg.clone()); }
+        HistoryChange::Edit(msg) => {
+            if let Some(old) = chat.iter_mut().find(|old| old.id == msg.id) {
+                let mut edited = msg.clone();
+                if edited.reactions.is_empty() && !old.reactions.is_empty() { edited.reactions = old.reactions.clone(); }
+                *old = edited;
+            }
+        }
+        HistoryChange::Delete(ids) => chat.retain(|msg| !ids.contains(&msg.id)),
+        HistoryChange::Reactions { msg_id, reactions, minimal } => {
+            if let Some(msg) = chat.iter_mut().find(|msg| msg.id == *msg_id) {
+                let mut next = reactions.clone();
+                if *minimal {
+                    for reaction in &mut next {
+                        if msg.reactions.iter().any(|old| old.kind == reaction.kind && old.chosen) { reaction.chosen = true; }
+                    }
+                }
+                msg.reactions = next;
+            }
+        }
+    }
+}
+
+/// Cache key used for an image attached to `msg_id` in `account`'s chat `peer_id`.
+fn media_cache_key(account: &str, peer_id: PeerId, msg_id: i32, token: Option<&str>) -> String {
+    format!("{account}_{}_{msg_id}_{}", peer_id, token.unwrap_or("none"))
+}
+
+fn media_token(media: &grammers_client::media::Media) -> Option<String> {
+    match media {
+        grammers_client::media::Media::Photo(photo) => Some(format!("p{}", photo.id())),
+        grammers_client::media::Media::Document(document) => Some(format!("d{}", document.id())),
+        _ => None,
+    }
+}
+
+fn split_media_token(media: &Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)>) -> Option<String> {
+    media.as_ref().and_then(|(_, object, _)| object.as_ref()).and_then(media_token)
+}
+
+fn parse_reactions(raw: &tl::enums::MessageReactions) -> (Vec<ReactionItem>, bool) {
+    let tl::enums::MessageReactions::Reactions(raw) = raw;
+    let reactions = raw.results.iter().filter_map(|item| {
+        let tl::enums::ReactionCount::Count(item) = item;
+        let kind = match &item.reaction {
+            tl::enums::Reaction::Emoji(emoji) => ReactionKind::Emoji(emoji.emoticon.clone()),
+            tl::enums::Reaction::CustomEmoji(emoji) => ReactionKind::Custom(emoji.document_id),
+            tl::enums::Reaction::Paid => ReactionKind::Paid,
+            tl::enums::Reaction::Empty => return None,
+        };
+        Some(ReactionItem { kind, count: item.count, chosen: item.chosen_order.is_some() })
+    }).collect();
+    (reactions, raw.min)
+}
+
+fn message_reactions(message: &grammers_client::message::Message) -> (Vec<ReactionItem>, bool) {
+    let raw = match &message.raw {
+        tl::enums::Message::Message(m) => m.reactions.as_ref(),
+        tl::enums::Message::Service(m) => m.reactions.as_ref(),
+        _ => None,
+    };
+    raw.map(parse_reactions).unwrap_or_default()
+}
+
+fn message_reply(message: &grammers_client::message::Message) -> Option<ReplyRef> {
+    match message.reply_header()? {
+        tl::enums::MessageReplyHeader::Header(header) => Some(ReplyRef {
+            id: header.reply_to_msg_id?,
+            peer: header.reply_to_peer_id.map(Into::into),
+            quote: header.quote_text,
+        }),
+        _ => None,
+    }
+}
+
+fn message_forwarded(message: &grammers_client::message::Message) -> Option<String> {
+    match message.forward_header()? {
+        tl::enums::MessageFwdHeader::Header(header) => Some(header.from_name.or(header.post_author).unwrap_or_default()),
+    }
+}
+
+fn message_item(message: &grammers_client::message::Message, media: &Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)>) -> MsgItem {
+    MsgItem {
+        id: message.id(), outgoing: message.outgoing(), edited: message.edit_date().is_some(), unix: message.date().timestamp(),
+        text: message.text().to_string(), media: media.as_ref().map(|(kind, _, _)| kind.clone()),
+        media_token: split_media_token(media), reply: message_reply(message),
+        forwarded: message_forwarded(message), reactions: message_reactions(message).0,
+    }
+}
+
+fn reaction_to_tl(kind: &ReactionKind) -> Option<tl::enums::Reaction> {
+    match kind {
+        ReactionKind::Emoji(emoticon) => Some(tl::types::ReactionEmoji { emoticon: emoticon.clone() }.into()),
+        ReactionKind::Custom(document_id) => Some(tl::types::ReactionCustomEmoji { document_id: *document_id }.into()),
+        ReactionKind::Paid => None,
+    }
+}
+
+/// Telegram uses this client-generated ID to deduplicate forward requests.
+fn forward_random_id() -> i64 {
+    use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock};
+    static NEXT: OnceLock<AtomicU64> = OnceLock::new();
+    let counter = NEXT.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos() as u64;
+        AtomicU64::new(nanos ^ u64::from(std::process::id()).rotate_left(32))
+    });
+    counter.fetch_add(1, Ordering::Relaxed) as i64
+}
+
+fn forwarded_message_id(updates: &tl::enums::Updates, random_id: i64) -> Option<i32> {
+    let find = |items: &[tl::enums::Update]| items.iter().find_map(|item| match item {
+        tl::enums::Update::MessageId(id) if id.random_id == random_id => Some(id.id),
+        _ => None,
+    });
+    match updates {
+        tl::enums::Updates::Updates(data) => find(&data.updates),
+        tl::enums::Updates::Combined(data) => find(&data.updates),
+        tl::enums::Updates::UpdateShort(data) => find(std::slice::from_ref(&data.update)),
+        _ => None,
+    }
+}
+
+fn preview_text(msg: &MsgItem) -> String {
+    let text = msg.text.lines().map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+    if !text.is_empty() { return truncate(&text, 64); }
+    match &msg.media { Some(MsgMedia::Photo) => "Photo".into(), Some(MsgMedia::Video(_)) => "Video".into(),
+        Some(MsgMedia::Label(label)) => label.clone(), None => "Message".into() }
+}
+
+/// The Telegram peer-specific mute is optional: absent means inherit the
+/// account-wide user/group/broadcast setting rather than unmuted.
+fn notification_mute_until(settings: &tl::enums::PeerNotifySettings) -> Option<i32> {
+    match settings { tl::enums::PeerNotifySettings::Settings(settings) => settings.mute_until }
+}
+
+/// Don't auto-download anything larger than this.
+const MAX_MEDIA_BYTES: u64 = 24 * 1024 * 1024;
+
+/// Full-screen image viewer state (ZapFast-style click-to-zoom).
+struct ViewerState {
+    /// Key into `textures`.
+    key: String,
+    /// Multiplier on top of the fit-to-screen scale (1.0 = fit).
+    zoom: f32,
+    /// Pan offset from the screen center, in points.
+    pan: egui::Vec2,
+}
+
+#[derive(Clone)]
+struct MeInfo {
+    full_name: String,
+    username: Option<String>,
+    user_id: i64,
+    server_premium: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ConnStatus {
+    Disabled,
+    Connecting,
+    Online,
+    Unauthorized,
+    Error(String),
+}
+
+#[derive(Clone)]
+enum LoginEvt {
+    NeedCode,
+    NeedPassword,
+    Done,
+    Failed(String),
+}
+
+enum Evt {
+    Config(Config),
+    Status { name: String, status: ConnStatus },
+    Me { name: String, me: MeInfo },
+    Dialogs { name: String, items: Vec<DialogItem>, observed: Instant },
+    DialogsComplete { account: String, request_id: Option<u64>, successful: bool },
+    NotifyPeer { account: String, peer_id: PeerId, until: Option<i32>, observed: Instant },
+    NotifySyncError { account: String, message: String },
+    NotifySyncComplete { account: String, successful: bool },
+    AlarmSettingSaved { request_id: u64, result: Result<(), String> },
+    AccountSettingSaved { name: String, connection: bool, request_id: u64, result: Result<(), String> },
+    NotifyDefault { account: String, category: Category, result: Result<Option<i32>, String>, observed: Instant },
+    History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
+    Incoming { account: String, peer_id: PeerId, msg: MsgItem, peer_name: Option<String>, peer_ref: Option<PeerRef> },
+    Edited { account: String, peer_id: PeerId, msg: MsgItem },
+    // Non-channel IDs are account-wide; Telegram does not include a peer.
+    Deleted { account: String, channel: Option<PeerId>, ids: Vec<i32> },
+    DeleteResult { account: String, peer_id: PeerId, msg_id: i32, result: Result<(), String> },
+    EditResult { account: String, peer_id: PeerId, msg_id: i32, request_id: u64, result: Result<(), String> },
+    HistoryFailed { account: String, peer_id: PeerId, message: String },
+    Reactions { account: String, peer_id: PeerId, msg_id: i32, reactions: Vec<ReactionItem>, minimal: bool },
+    ReactionResult { account: String, peer_id: PeerId, msg_id: i32, observed: Instant, result: Result<Option<(Vec<ReactionItem>, bool)>, String> },
+    ForwardResult { account: String, destination: PeerId, request_id: u64, result: Result<Option<MsgItem>, String> },
+    Sent {
+        account: String,
+        peer_id: PeerId,
+        result: Result<MsgItem, String>,
+        /// Local source path when the sent message carries a photo we sent —
+        /// the GUI can cache it for display without re-downloading.
+        source_path: Option<PathBuf>,
+        draft: SendDraft,
+    },
+    /// Hand a video Media handle to the GUI, which echoes it back as
+    /// `Cmd::StashMedia` (the worker updater cannot borrow `self`).
+    StashMedia { cache_key: String, media: grammers_client::media::Media },
+    /// An image finished downloading (or failed — empty `path`).
+    MediaReady {
+        account: String,
+        peer_id: PeerId,
+        msg_id: i32,
+        cache_key: String,
+        path: PathBuf,
+        /// Photo vs video — decides whether the GUI decodes a texture or opens the player.
+        kind: MsgMedia,
+    },
+    ReadUpdate { account: String, peer_id: PeerId, max_id: i32, remaining: u32 },
+    ReadResult { account: String, peer_id: PeerId, max_id: i32, result: Result<(), String> },
+    VideoError { cache_key: String, message: String },
+    Login { name: String, state: LoginEvt },
+    Toast(String),
+}
+
+// ---------------------------------------------------------------------------
+// Worker side (background tokio thread). Owns the Config so the GUI never
+// writes config.json behind its back — single writer, no races.
+// ---------------------------------------------------------------------------
+
+/// Classify a message's media. Returns `(kind, downloadable, size_hint)`.
+fn split_media(
+    message: &grammers_client::message::Message,
+) -> Option<(MsgMedia, Option<grammers_client::media::Media>, Option<u64>)> {
+    use grammers_client::media::Media;
+    let media = message.media()?;
+    let triple = match media {
+        Media::Photo(p) => (MsgMedia::Photo, Some(Media::Photo(p.clone())), p.size().map(|s| s as u64)),
+        Media::Document(d) => {
+            let mime = d.mime_type().unwrap_or("").to_string();
+            let name = d.name().map(str::to_string);
+            let size = d.size().map(|s| s as u64);
+            // We can only decode jpeg/png/bmp in-process; show the rest as captions.
+            let decodable = matches!(mime.as_str(), "image/jpeg" | "image/png" | "image/bmp");
+            if decodable {
+                (MsgMedia::Photo, Some(Media::Document(d.clone())), size)
+            } else if mime.starts_with("video/") {
+                let label = match (&name, size) {
+                    (Some(n), Some(s)) => format!("{n} ({})", util::human_bytes(s)),
+                    (Some(n), None) => n.clone(),
+                    (None, Some(s)) => format!("{} · {}", mime, util::human_bytes(s)),
+                    (None, None) => "video".to_string(),
+                };
+                (MsgMedia::Video(label), Some(Media::Document(d.clone())), size)
+            } else if mime.starts_with("image/") {
+                let label = name.unwrap_or_else(|| "image".into());
+                (MsgMedia::Label(label), None, None)
+            } else {
+                let label = match (&name, size) {
+                    (Some(n), Some(s)) => format!("{n} ({})", util::human_bytes(s)),
+                    (Some(n), None) => n.clone(),
+                    (None, Some(s)) => format!("{} · {}", mime, util::human_bytes(s)),
+                    (None, None) => {
+                        if mime.is_empty() { "document".into() } else { mime.clone() }
+                    }
+                };
+                (MsgMedia::Label(label), None, None)
+            }
+        }
+        Media::Sticker(_) => (MsgMedia::Label("sticker".into()), None, None),
+        Media::Contact(_) => (MsgMedia::Label("contact".into()), None, None),
+        Media::Poll(_) => (MsgMedia::Label("poll".into()), None, None),
+        Media::Geo(_) | Media::Venue(_) | Media::GeoLive(_) => {
+            (MsgMedia::Label("location".into()), None, None)
+        }
+        Media::Dice(_) => (MsgMedia::Label("dice".into()), None, None),
+        Media::WebPage(_) => (MsgMedia::Label("link preview".into()), None, None),
+        // Media is #[non_exhaustive]; stay honest about unknown variants.
+        _ => (MsgMedia::Label("media".into()), None, None),
+    };
+    Some(triple)
+}
+
+/// Format seconds as `m:ss` (or `h:mm:ss` past an hour) for the video HUD.
+fn format_mmss(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "0:00".to_string();
+    }
+    let total = seconds as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+fn media_extension(media: &grammers_client::media::Media) -> String {
+    use grammers_client::media::Media;
+    match media {
+        Media::Photo(_) => "jpg".into(),
+        Media::Document(d) => {
+            // Prefer the original filename extension (keeps mkv/mov/… honest).
+            let from_name = d
+                .name()
+                .and_then(|n| std::path::Path::new(n).extension().map(|e| e.to_string_lossy().into_owned()))
+                .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()));
+            if let Some(ext) = from_name {
+                return ext.to_ascii_lowercase();
+            }
+            match d.mime_type().unwrap_or("") {
+                "image/png" => "png",
+                "image/bmp" => "bmp",
+                "video/webm" => "webm",
+                "video/x-matroska" => "mkv",
+                "video/quicktime" => "mov",
+                "video/x-msvideo" => "avi",
+                "video/mpeg" => "mpg",
+                "video/3gpp" => "3gp",
+                "video/ogg" => "ogv",
+                _ => "mp4",
+            }
+            .into()
+        }
+        _ => "bin".into(),
+    }
+}
+
+fn video_label_for(media: &grammers_client::media::Media) -> String {
+    use grammers_client::media::Media;
+    match media {
+        Media::Document(d) => d
+            .name()
+            .map(str::to_string)
+            .or_else(|| d.mime_type().map(|m| m.to_string()))
+            .unwrap_or_else(|| "video".into()),
+        _ => "video".into(),
+    }
+}
+
+/// Largest video we will auto-start downloading (honest cap; bigger files toast instead).
+const MAX_VIDEO_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Download an image to `<data_dir>/cache/media/<cache_key>.<ext>` off the
+/// critical path; the GUI gets an `Evt::MediaReady` when it's on disk.
+#[allow(clippy::too_many_arguments)]
+fn spawn_media_download(
+    client: &Client,
+    data_dir: &std::path::Path,
+    account: &str,
+    peer_id: PeerId,
+    msg_id: i32,
+    media: grammers_client::media::Media,
+    size_hint: Option<u64>,
+    evt_tx: &std_mpsc::Sender<Evt>,
+    ctx: &egui::Context,
+    cap_bytes: u64,
+) {
+    if let Some(size) = size_hint {
+        if size > cap_bytes {
+            return;
+        }
+    }
+    let account_s = account.to_string();
+    let token = media_token(&media);
+    let cache_key = media_cache_key(account, peer_id, msg_id, token.as_deref());
+    let dir = data_dir.join("cache").join("media");
+    let _ = std::fs::create_dir_all(&dir);
+    let kind: MsgMedia = match &media {
+        grammers_client::media::Media::Document(d)
+            if d.mime_type().unwrap_or("").starts_with("video/") =>
+        {
+            MsgMedia::Video(video_label_for(&media))
+        }
+        _ => MsgMedia::Photo,
+    };
+    let path = dir.join(format!("{cache_key}.{}", media_extension(&media)));
+    if path.exists() {
+        let _ = evt_tx.send(Evt::MediaReady { account: account_s, peer_id, msg_id, cache_key, path, kind });
+        ctx.request_repaint();
+        return;
+    }
+    let client = client.clone();
+    let evt_tx = evt_tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        // Write to a temporary file, never treating a partial download as cached.
+        // Enforce the cap on actual bytes even if the size hint is absent or wrong.
+        use std::io::Write;
+        let temp_path = path.with_extension(format!("{}.part", path.extension().unwrap_or_default().to_string_lossy()));
+        let ok = async {
+            let mut file = std::fs::File::create(&temp_path).map_err(|_| ())?;
+            let mut download = client.iter_download(&media);
+            let mut total = 0u64;
+            while let Some(chunk) = download.next().await.map_err(|_| ())? {
+                total = total.checked_add(chunk.len() as u64).ok_or(())?;
+                if total > cap_bytes { return Err(()); }
+                file.write_all(&chunk).map_err(|_| ())?;
+            }
+            drop(file);
+            std::fs::rename(&temp_path, &path).map_err(|_| ())?;
+            Ok::<(), ()>(())
+        }.await.is_ok();
+        if !ok { let _ = std::fs::remove_file(&temp_path); }
+        let _ = evt_tx.send(Evt::MediaReady {
+            account: account_s,
+            peer_id,
+            msg_id,
+            cache_key,
+            // An empty path signals "download failed" to the GUI.
+            path: if ok { path } else { PathBuf::new() },
+            kind,
+        });
+        ctx.request_repaint();
+    });
+}
+
+
+struct AccountConn {
+    client: Client,
+    pool: tokio::task::JoinHandle<()>,
+    stop_updates: Option<tokio::sync::oneshot::Sender<()>>,
+    updates_task: Option<tokio::task::JoinHandle<()>>,
+    /// Latest known peers, refreshed with every dialog list fetch.
+    peer_refs: HashMap<PeerId, PeerRef>,
+}
+
+enum PendingLogin {
+    AwaitingCode {
+        client: Client,
+        pool: tokio::task::JoinHandle<()>,
+        phone: String,
+        token: LoginToken,
+    },
+    AwaitingPassword {
+        client: Client,
+        pool: tokio::task::JoinHandle<()>,
+        phone: String,
+        token: PasswordToken,
+    },
+}
+
+struct Worker {
+    data_dir: PathBuf,
+    cfg: Config,
+    evt_tx: std_mpsc::Sender<Evt>,
+    ctx: egui::Context,
+    conns: HashMap<String, AccountConn>,
+    pending_logins: HashMap<String, PendingLogin>,
+    /// Kept-alive raw video Media handles for on-demand downloads (capped).
+    media_objects: HashMap<String, grammers_client::media::Media>,
+}
+
+impl Worker {
+    fn emit(&self, evt: Evt) {
+        let _ = self.evt_tx.send(evt);
+        self.ctx.request_repaint();
+    }
+
+    fn broadcast_config(&self) {
+        self.emit(Evt::Config(self.cfg.clone()));
+    }
+
+    fn api_creds(&self) -> Result<(i32, String), String> {
+        self.cfg
+            .effective_api_creds()
+            .ok_or_else(|| {
+                "missing Telegram API credentials — open Settings (gear) and save them"
+                    .to_string()
+            })
+    }
+
+    async fn open_session(
+        &self,
+        name: &str,
+        api_id: i32,
+        want_updates: bool,
+    ) -> Result<(Client, tokio::task::JoinHandle<()>, Option<tokio::sync::mpsc::UnboundedReceiver<grammers_session::updates::UpdatesLike>>), String> {
+        let conn = telegram::connect(&self.data_dir, api_id, name, want_updates)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((conn.client, conn.pool, conn.updates))
+    }
+
+    /// Connect one account, verify auth, capture identity, start keep-alive
+    /// update stream. Failures still report a status so the GUI can show it.
+    async fn bring_online(&mut self, name: String) {
+        if !self.cfg.find_account(&name).is_some_and(|a| a.enabled) {
+            self.emit(Evt::Status { name, status: ConnStatus::Disabled });
+            return;
+        }
+        if self.conns.contains_key(&name) { return; }
+        let Ok((api_id, _)) = self.api_creds() else {
+            self.emit(Evt::Status {
+                name,
+                status: ConnStatus::Error("missing API credentials".into()),
+            });
+            return;
+        };
+        self.emit(Evt::Status { name: name.clone(), status: ConnStatus::Connecting });
+        let connected = self.open_session(&name, api_id, true).await;
+        let (client, pool, updates) = match connected {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.emit(Evt::Status { name, status: ConnStatus::Error(e) });
+                return;
+            }
+        };
+        match client.is_authorized().await {
+            Ok(true) => {}
+            Ok(false) => {
+                telegram::shutdown(client, pool).await;
+                self.emit(Evt::Status { name, status: ConnStatus::Unauthorized });
+                return;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                telegram::shutdown(client, pool).await;
+                self.emit(Evt::Status { name, status: ConnStatus::Error(msg) });
+                return;
+            }
+        }
+        // Capture identity (and keep the "whoami" data fresh).
+        if let Ok(me) = client.get_me().await {
+            let info = MeInfo {
+                full_name: me.full_name(),
+                username: me.username().map(str::to_string),
+                user_id: me.id().bot_api_dialog_id(),
+                server_premium: me.is_premium(),
+            };
+            // Refresh registry username silently.
+            if let Some(acc) = self.cfg.find_account_mut(&name) {
+                acc.username = info.username.clone();
+                acc.user_id = Some(info.user_id);
+            }
+            let _ = self.cfg.save(&self.data_dir);
+            self.broadcast_config();
+            self.emit(Evt::Me { name: name.clone(), me: info });
+        }
+        self.emit(Evt::Status { name: name.clone(), status: ConnStatus::Online });
+
+        // Keep the update stream hot — this is what keeps the account active.
+        let evt_tx = self.evt_tx.clone();
+        let ctx = self.ctx.clone();
+        let account = name.clone();
+        let data_dir = self.data_dir.clone();
+        let update_client = client.clone();
+        let download_client = client.clone();
+        let (stop_updates, mut stop_rx) = tokio::sync::oneshot::channel();
+        let updates_task = updates.map(|updates_rx| {
+            tokio::spawn(async move {
+                let mut stream = update_client
+                    .stream_updates(
+                        updates_rx,
+                        UpdatesConfiguration { catch_up: false, ..Default::default() },
+                    )
+                    .await;
+                loop {
+                    let next = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        next = stream.next() => next,
+                    };
+                    match next {
+                        Ok(Update::NewMessage(message)) => {
+                            let media = split_media(&message);
+                            let msg_id = message.id();
+                            let peer_id = message.peer_id();
+                            let peer_name = message.peer().and_then(|peer| peer.name()).map(str::to_owned);
+                            let peer_ref = message.peer_ref().await;
+                            let msg = message_item(&message, &media);
+                            if let Some((kind, obj, size)) = media {
+                                let cache_key = media_cache_key(&account, peer_id, msg_id, msg.media_token.as_deref());
+                                match kind {
+                                    MsgMedia::Photo => {
+                                        if let Some(o) = obj {
+                                            spawn_media_download(
+                                                &download_client,
+                                                &data_dir,
+                                                &account,
+                                                peer_id,
+                                                msg_id,
+                                                o,
+                                                size,
+                                                &evt_tx,
+                                                &ctx,
+                                                MAX_MEDIA_BYTES,
+                                            );
+                                        }
+                                    }
+                                    MsgMedia::Video(_) => {
+                                        if let Some(o) = obj {
+                                            let _ = evt_tx.send(Evt::StashMedia { cache_key, media: o });
+                                        }
+                                    }
+                                    MsgMedia::Label(_) => {}
+                                }
+                            }
+                            let _ = evt_tx.send(Evt::Incoming {
+                                account: account.clone(),
+                                peer_id,
+                                msg,
+                                peer_name,
+                                peer_ref,
+                            });
+                            ctx.request_repaint();
+                        }
+                        Ok(Update::MessageEdited(message)) => {
+                            let peer_id = message.peer_id();
+                            let media = split_media(&message);
+                            let msg = message_item(&message, &media);
+                            if let Some((kind, Some(obj), size)) = media {
+                                let cache_key = media_cache_key(&account, peer_id, msg.id, msg.media_token.as_deref());
+                                match kind {
+                                    MsgMedia::Photo => spawn_media_download(&download_client, &data_dir,
+                                        &account, peer_id, msg.id, obj, size, &evt_tx, &ctx, MAX_MEDIA_BYTES),
+                                    MsgMedia::Video(_) => { let _ = evt_tx.send(Evt::StashMedia { cache_key, media: obj }); }
+                                    MsgMedia::Label(_) => {}
+                                }
+                            }
+                            let _ = evt_tx.send(Evt::Edited { account: account.clone(), peer_id, msg });
+                            ctx.request_repaint();
+                        }
+                        Ok(Update::MessageDeleted(deletion)) => {
+                            let channel = deletion.channel_id().map(PeerId::channel);
+                            let ids = deletion.into_messages();
+                            let _ = evt_tx.send(Evt::Deleted { account: account.clone(), channel, ids });
+                            ctx.request_repaint();
+                        }
+                        Ok(Update::Raw(update)) => {
+                            if let tl::enums::Update::MessageReactions(ref update) = update.raw {
+                                let (reactions, minimal) = parse_reactions(&update.reactions);
+                                let _ = evt_tx.send(Evt::Reactions { account: account.clone(),
+                                    peer_id: update.peer.clone().into(), msg_id: update.msg_id, reactions, minimal });
+                                ctx.request_repaint();
+                            }
+                            let read = match update.raw {
+                                tl::enums::Update::ReadHistoryInbox(ref r) if r.top_msg_id.is_none() =>
+                                    Some((r.peer.clone().into(), r.max_id, r.still_unread_count.max(0) as u32)),
+                                tl::enums::Update::ReadChannelInbox(ref r) =>
+                                    Some((PeerId::channel(r.channel_id), r.max_id, r.still_unread_count.max(0) as u32)),
+                                _ => None,
+                            };
+                            if let Some((peer_id, max_id, remaining)) = read {
+                                let _ = evt_tx.send(Evt::ReadUpdate { account: account.clone(), peer_id, max_id, remaining });
+                                ctx.request_repaint();
+                            }
+                            if let tl::enums::Update::NotifySettings(ref notification) = update.raw {
+                                let until = notification_mute_until(&notification.notify_settings);
+                                let observed = Instant::now();
+                                let event = match &notification.peer {
+                                    tl::enums::NotifyPeer::Peer(peer) => Some(Evt::NotifyPeer {
+                                        account: account.clone(), peer_id: peer.peer.clone().into(), until, observed,
+                                    }),
+                                    tl::enums::NotifyPeer::NotifyUsers => Some(Evt::NotifyDefault {
+                                        account: account.clone(), category: Category::User, result: Ok(until), observed,
+                                    }),
+                                    tl::enums::NotifyPeer::NotifyChats => Some(Evt::NotifyDefault {
+                                        account: account.clone(), category: Category::Group, result: Ok(until), observed,
+                                    }),
+                                    tl::enums::NotifyPeer::NotifyBroadcasts => Some(Evt::NotifyDefault {
+                                        account: account.clone(), category: Category::Broadcast, result: Ok(until), observed,
+                                    }),
+                                    _ => None, // individual forum topics need topic-level unread state
+                                };
+                                if let Some(event) = event { let _ = evt_tx.send(event); ctx.request_repaint(); }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = evt_tx.send(Evt::Status {
+                                name: account.clone(),
+                                status: ConnStatus::Error(format!("update stream ended: {e}")),
+                            });
+                            ctx.request_repaint();
+                            break;
+                        }
+                    }
+                }
+                // Update stream ended; persist the sync state so the next
+                // session starts from a consistent point.
+                stream.sync_update_state().await;
+            })
+        });
+        self.conns.insert(name.clone(), AccountConn { client, pool, stop_updates: Some(stop_updates), updates_task, peer_refs: HashMap::new() });
+
+        // Pre-load dialogs so the chat list is warm.
+        self.refresh_dialogs(&name, None).await;
+    }
+
+    async fn refresh_dialogs(&mut self, name: &str, request_id: Option<u64>) {
+        let Some(client) = self.conns.get(name).map(|conn| conn.client.clone()) else {
+            self.emit(Evt::DialogsComplete { account: name.into(), request_id, successful: false });
+            return;
+        };
+        // Per-chat settings can inherit one of these three account defaults.
+        let mut defaults_ok = true;
+        for (category, peer) in [
+            (Category::User, tl::enums::InputNotifyPeer::InputNotifyUsers),
+            (Category::Group, tl::enums::InputNotifyPeer::InputNotifyChats),
+            (Category::Broadcast, tl::enums::InputNotifyPeer::InputNotifyBroadcasts),
+        ] {
+            let observed = Instant::now();
+            let result = client.invoke(&tl::functions::account::GetNotifySettings { peer }).await
+                .map(|settings| notification_mute_until(&settings)).map_err(|e| e.to_string());
+            if result.is_err() { defaults_ok = false; }
+            self.emit(Evt::NotifyDefault { account: name.to_owned(), category, result, observed });
+        }
+        let observed = Instant::now();
+        let Some(conn) = self.conns.get_mut(name) else {
+            self.emit(Evt::DialogsComplete { account: name.into(), request_id, successful: false });
+            return;
+        };
+        // Fetch every dialog so an unread chat beyond an arbitrary UI limit
+        // can still trigger the alarm at startup.
+        let mut iter = conn.client.iter_dialogs();
+        let mut items = Vec::new();
+        let mut dialog_error = None;
+        loop {
+            let dialog = match iter.next().await {
+                Ok(Some(dialog)) => dialog,
+                Ok(None) => break,
+                Err(error) => { dialog_error = Some(error.to_string()); break; }
+            };
+            let peer_id = dialog.peer_id();
+            let peer_ref = dialog.peer_ref();
+            conn.peer_refs.insert(peer_id, peer_ref);
+            let preview = dialog.last_message.as_ref().map(|m| {
+                m.text()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            let preview = preview.and_then(|p| {
+                let p = p.trim().to_string();
+                if p.is_empty() { None } else { Some(truncate(&p, 80)) }
+            });
+            let (unread_count, top_message, read_inbox_max_id, mute_until, pinned) = match &dialog.raw {
+                tl::enums::Dialog::Dialog(raw) => (raw.unread_count.max(0) as u32, raw.top_message, raw.read_inbox_max_id, notification_mute_until(&raw.notify_settings), raw.pinned),
+                _ => continue,
+            };
+            let category = match dialog.peer() {
+                grammers_client::peer::Peer::User(_) => Category::User,
+                grammers_client::peer::Peer::Group(_) => Category::Group,
+                grammers_client::peer::Peer::Channel(_) => Category::Broadcast,
+            };
+            items.push(DialogItem {
+                peer_id,
+                name: dialog.peer().name().unwrap_or("?").to_string(),
+                preview,
+                unread_count,
+                top_message,
+                read_inbox_max_id,
+                category,
+                mute_until,
+                pinned,
+                resolved: true,
+            });
+        }
+        let dialogs_ok = dialog_error.is_none();
+        // Never replace a complete list with an incomplete page on failure.
+        if dialogs_ok { self.emit(Evt::Dialogs { name: name.to_string(), items, observed }); }
+        if let Some(message) = dialog_error {
+            self.emit(Evt::NotifySyncError { account: name.to_owned(), message });
+        }
+        self.emit(Evt::NotifySyncComplete { account: name.to_owned(), successful: defaults_ok && dialogs_ok });
+        self.emit(Evt::DialogsComplete { account: name.to_owned(), request_id, successful: dialogs_ok });
+    }
+
+    async fn fetch_history(&mut self, account: &str, peer_id: PeerId) {
+        let Some(conn) = self.conns.get(account) else {
+            self.emit(Evt::HistoryFailed { account: account.into(), peer_id, message: "account is not connected".into() });
+            return;
+        };
+        let Some(&peer_ref) = conn.peer_refs.get(&peer_id) else {
+            self.emit(Evt::HistoryFailed { account: account.into(), peer_id, message: "chat not resolved — refresh the chat list".into() });
+            return;
+        };
+        let mut iter = conn.client.iter_messages(peer_ref).limit(HISTORY_PAGE);
+        let mut messages = Vec::with_capacity(HISTORY_PAGE);
+        let mut downloads = Vec::new();
+        loop {
+            let message = match iter.next().await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(e) => {
+                    self.emit(Evt::HistoryFailed { account: account.into(), peer_id, message: e.to_string() });
+                    return;
+                }
+            };
+            let id = message.id();
+            let media = split_media(&message);
+            let msg = message_item(&message, &media);
+            if let Some((kind, obj, size)) = media {
+                let cache_key = media_cache_key(account, peer_id, id, msg.media_token.as_deref());
+                match kind {
+                    // Photos auto-download (small); videos wait for a tap.
+                    MsgMedia::Photo => {
+                        if let Some(o) = obj {
+                            downloads.push((id, o, size));
+                        }
+                    }
+                    MsgMedia::Video(_) => {
+                        if let Some(o) = obj {
+                            if self.media_objects.len() >= 96 {
+                                self.media_objects.clear();
+                            }
+                            self.media_objects.insert(cache_key, o);
+                        }
+                    }
+                    MsgMedia::Label(_) => {}
+                }
+            }
+            messages.push(msg);
+        }
+        messages.reverse(); // newest first from the iterator; show oldest on top
+        // Emit history first so text paints immediately…
+        self.emit(Evt::History { account: account.to_string(), peer_id, messages });
+        // …then fetch images in the background (newest 12).
+        if let Some(conn) = self.conns.get(account) {
+            for (msg_id, media, size) in downloads.into_iter().take(12) {
+                spawn_media_download(
+                    &conn.client,
+                    &self.data_dir,
+                    account,
+                    peer_id,
+                    msg_id,
+                    media,
+                    size,
+                    &self.evt_tx,
+                    &self.ctx,
+                    MAX_MEDIA_BYTES,
+                );
+            }
+        }
+    }
+
+    async fn mark_read(&mut self, account: &str, peer_id: PeerId, max_id: i32) {
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            None => Err("account or chat is not connected".to_string()),
+            Some((client, peer)) => {
+                if peer_id.kind() == grammers_session::types::PeerKind::Channel {
+                    client.invoke(&tl::functions::channels::ReadHistory { channel: peer.into(), max_id }).await.map(|_| ()).map_err(|e| e.to_string())
+                } else {
+                    client.invoke(&tl::functions::messages::ReadHistory { peer: peer.into(), max_id }).await.map(|_| ()).map_err(|e| e.to_string())
+                }
+            }
+        };
+        self.emit(Evt::ReadResult { account: account.to_string(), peer_id, max_id, result });
+    }
+
+    async fn delete_message(&mut self, account: &str, peer_id: PeerId, msg_id: i32) {
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            Some((client, peer)) => client.delete_messages(peer, &[msg_id]).await.map(|_| ()).map_err(|e| e.to_string()),
+            None => Err("account or chat is not connected".into()),
+        };
+        self.emit(Evt::DeleteResult { account: account.into(), peer_id, msg_id, result });
+    }
+
+    async fn edit_message(&mut self, account: &str, peer_id: PeerId, msg_id: i32, text: String, request_id: u64) {
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            Some((client, peer)) => client.edit_message(peer, msg_id, text).await.map_err(|error| error.to_string()),
+            None => Err("account or chat is not connected".into()),
+        };
+        self.emit(Evt::EditResult { account: account.into(), peer_id, msg_id, request_id, result });
+    }
+
+    async fn send_text(&mut self, account: &str, peer_id: PeerId, text: String, reply_to: Option<i32>) {
+        let draft = SendDraft { text: text.clone(), attachment: None, reply_to };
+        let Some(conn) = self.conns.get(account) else {
+            self.emit(Evt::Sent {
+                account: account.to_string(),
+                peer_id,
+                result: Err("account is not connected".into()),
+                source_path: None, draft,
+            });
+            return;
+        };
+        let Some(&peer_ref) = conn.peer_refs.get(&peer_id) else {
+            self.emit(Evt::Sent {
+                account: account.to_string(),
+                peer_id,
+                result: Err("peer not resolved — refresh the chat list".into()),
+                source_path: None, draft,
+            });
+            return;
+        };
+        let input = grammers_client::message::InputMessage::new().text(text).reply_to(reply_to);
+        let result = conn.client.send_message(peer_ref, input).await
+            .map(|message| { let media = split_media(&message); message_item(&message, &media) })
+            .map_err(|e| e.to_string());
+        self.emit(Evt::Sent { account: account.to_string(), peer_id, result, source_path: None, draft });
+    }
+
+    async fn send_photo(&mut self, account: &str, peer_id: PeerId, path: PathBuf, caption: String, reply_to: Option<i32>) {
+        let draft = SendDraft { text: caption.clone(), attachment: Some(path.clone()), reply_to };
+        let Some(conn) = self.conns.get(account) else {
+            self.emit(Evt::Sent {
+                account: account.to_string(),
+                peer_id,
+                result: Err("account is not connected".into()),
+                source_path: None, draft,
+            });
+            return;
+        };
+        let Some(&peer_ref) = conn.peer_refs.get(&peer_id) else {
+            self.emit(Evt::Sent {
+                account: account.to_string(),
+                peer_id,
+                result: Err("peer not resolved — refresh the chat list".into()),
+                source_path: None, draft,
+            });
+            return;
+        };
+        let uploaded = conn.client.upload_file(&path).await.map_err(|e| e.to_string());
+        let result = match uploaded {
+            Ok(uploaded) => {
+                let message = grammers_client::message::InputMessage::new()
+                    .text(caption.clone())
+                    .photo(uploaded)
+                    .reply_to(reply_to);
+                conn.client
+                    .send_message(peer_ref, message)
+                    .await
+                    .map(|message| {
+                        let media = split_media(&message);
+                        let mut item = message_item(&message, &media);
+                        if item.media.is_none() { item.media = Some(MsgMedia::Photo); }
+                        item
+                    })
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(format!("upload failed: {e}")),
+        };
+        self.emit(Evt::Sent { account: account.to_string(), peer_id, result, source_path: Some(path), draft });
+    }
+
+    async fn forward_message(&mut self, account: &str, source: PeerId, destination: PeerId, msg_id: i32, request_id: u64) {
+        let self_id = self.cfg.find_account(account).and_then(|meta| meta.user_id).filter(|id| *id > 0).map(PeerId::user);
+        let result = match self.conns.get(account).and_then(|conn| {
+            let to = conn.peer_refs.get(&destination).copied().or_else(|| {
+                (Some(destination) == self_id).then_some(PeerRef { id: PeerId::self_user(), auth: Default::default() })
+            })?;
+            Some((conn.client.clone(), *conn.peer_refs.get(&source)?, to))
+        }) {
+            None => Err("account or chat is not connected; refresh the chat list".into()),
+            Some((client, from, to)) => {
+                let random_id = forward_random_id();
+                let request = tl::functions::messages::ForwardMessages {
+                    silent: false, background: false, with_my_score: false, drop_author: false,
+                    drop_media_captions: false, noforwards: false, allow_paid_floodskip: false,
+                    from_peer: from.into(), id: vec![msg_id], random_id: vec![random_id], to_peer: to.into(),
+                    top_msg_id: None, reply_to: None, schedule_date: None, schedule_repeat_period: None,
+                    send_as: None, quick_reply_shortcut: None, effect: None, video_timestamp: None,
+                    allow_paid_stars: None, suggested_post: None,
+                };
+                match client.invoke(&request).await {
+                    Err(error) => Err(error.to_string()),
+                    Ok(updates) => {
+                        let id = forwarded_message_id(&updates, random_id);
+                        let message = if let Some(id) = id {
+                            client.get_messages_by_id(to, &[id]).await.ok().and_then(|items| items.into_iter().next().flatten())
+                        } else { None };
+                        Ok(message.map(|message| { let media = split_media(&message); message_item(&message, &media) }))
+                    }
+                }
+            }
+        };
+        self.emit(Evt::ForwardResult { account: account.into(), destination, request_id, result });
+    }
+
+    async fn react(&mut self, account: &str, peer_id: PeerId, msg_id: i32, reactions: Vec<ReactionKind>) {
+        let observed = Instant::now();
+        let result = match self.conns.get(account).and_then(|conn| conn.peer_refs.get(&peer_id).map(|peer| (conn.client.clone(), *peer))) {
+            None => Err("account or chat is not connected".into()),
+            Some((client, peer)) => {
+                let raw: Vec<tl::enums::Reaction> = reactions.iter().filter_map(reaction_to_tl).collect();
+                match client.send_reactions(peer, msg_id, raw).await {
+                    Err(error) => Err(error.to_string()),
+                    Ok(()) => match client.get_messages_by_id(peer, &[msg_id]).await {
+                        Ok(messages) => Ok(messages.into_iter().next().flatten().map(|message| message_reactions(&message))),
+                        Err(_) => Ok(None), // Sent, but the authoritative refresh failed.
+                    },
+                }
+            }
+        };
+        self.emit(Evt::ReactionResult { account: account.into(), peer_id, msg_id, observed, result });
+    }
+
+    /// Kick off (or fast-path) an embedded playback for a video message.
+    async fn open_video(&mut self, account: &str, peer_id: PeerId, msg_id: i32, cache_key: String) {
+        let Some(client) = self.conns.get(account).map(|c| c.client.clone()) else {
+            self.emit(Evt::VideoError { cache_key, message: "account is not connected".into() });
+            return;
+        };
+        let dir = self.data_dir.join("cache").join("media");
+        // Fast path: already downloaded under any known extension.
+        for ext in ["mp4", "webm", "mkv", "mov", "avi", "mpg", "3gp", "ogv", "mpeg", "bin"] {
+            let candidate = dir.join(format!("{cache_key}.{ext}"));
+            if candidate.exists() {
+                self.emit(Evt::MediaReady {
+                    account: account.to_string(),
+                    peer_id,
+                    msg_id,
+                    cache_key,
+                    path: candidate,
+                    kind: MsgMedia::Video(String::new()),
+                });
+                return;
+            }
+        }
+        let Some(media) = self.media_objects.get(&cache_key).cloned() else {
+            self.emit(Evt::VideoError { cache_key, message:
+                "video unavailable — reopen the chat (media list was refreshed)".into(),
+            });
+            return;
+        };
+        let size_hint = match &media {
+            grammers_client::media::Media::Document(d) => d.size().map(|s| s as u64),
+            _ => None,
+        };
+        if let Some(size) = size_hint {
+            if size > MAX_VIDEO_BYTES {
+                self.emit(Evt::VideoError { cache_key, message: format!(
+                    "video is {} — too large to download here (cap {})",
+                    util::human_bytes(size),
+                    util::human_bytes(MAX_VIDEO_BYTES),
+                ) });
+                return;
+            }
+            self.emit(Evt::Toast(format!("downloading video ({})…", util::human_bytes(size))));
+        } else {
+            self.emit(Evt::Toast("downloading video…".into()));
+        }
+        spawn_media_download(
+            &client,
+            &self.data_dir,
+            account,
+            peer_id,
+            msg_id,
+            media,
+            size_hint,
+            &self.evt_tx,
+            &self.ctx,
+            MAX_VIDEO_BYTES,
+        );
+    }
+
+    fn persist_login(&mut self, name: &str, phone: &str, user: &grammers_client::peer::User) {
+        let now = util::now_unix();
+        let created = self
+            .cfg
+            .find_account(name)
+            .map(|a| a.created_unix)
+            .unwrap_or(now);
+        let (enabled, alarm_enabled) = self.cfg.find_account(name).map(|a| (a.enabled, a.alarm_enabled)).unwrap_or((true, true));
+        self.cfg.upsert_account(AccountMeta {
+            name: name.to_string(),
+            phone: Some(phone.to_string()),
+            user_id: Some(user.id().bot_api_dialog_id()),
+            username: user.username().map(str::to_string),
+            created_unix: created,
+            last_login_unix: Some(now),
+            enabled, alarm_enabled,
+        });
+        if let Err(e) = self.cfg.save(&self.data_dir) {
+            log_warn!("failed to save config after login: {e}");
+        }
+    }
+
+    async fn begin_login(&mut self, name: String, phone: String) {
+        if !util::valid_account_name(&name) {
+            self.emit(Evt::Login {
+                name,
+                state: LoginEvt::Failed(
+                    "invalid account name (allowed: a-z A-Z 0-9 _ - ., max 64 chars)".into(),
+                ),
+            });
+            return;
+        }
+        if self.cfg.find_account(&name).is_some() || self.pending_logins.contains_key(&name) {
+            self.emit(Evt::Login {
+                name,
+                state: LoginEvt::Failed("an account with that name already exists".into()),
+            });
+            return;
+        }
+        let (api_id, api_hash) = match self.api_creds() {
+            Ok(c) => c,
+            Err(e) => {
+                self.emit(Evt::Login { name, state: LoginEvt::Failed(e) });
+                return;
+            }
+        };
+        // Fresh login: move any previous session aside rather than mixing credentials.
+        let session = util::session_path(&self.data_dir, &name);
+        if session.exists() {
+            let backup = session.with_extension(format!("sqlite.bak-{}", util::now_unix()));
+            let _ = std::fs::rename(&session, &backup);
+        }
+        let (client, pool, _) = match self.open_session(&name, api_id, false).await {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.emit(Evt::Login { name, state: LoginEvt::Failed(e) });
+                return;
+            }
+        };
+        match client.request_login_code(phone.trim(), &api_hash).await {
+            Ok(token) => {
+                self.pending_logins.insert(
+                    name.clone(),
+                    PendingLogin::AwaitingCode { client, pool, phone: phone.trim().to_string(), token },
+                );
+                self.emit(Evt::Login { name, state: LoginEvt::NeedCode });
+            }
+            Err(e) => {
+                let msg = format!("code request failed: {e}");
+                telegram::shutdown(client, pool).await;
+                self.emit(Evt::Login { name, state: LoginEvt::Failed(msg) });
+            }
+        }
+    }
+
+    async fn submit_code(&mut self, name: String, code: String) {
+        let Some(pending) = self.pending_logins.remove(&name) else { return };
+        let PendingLogin::AwaitingCode { client, pool, phone, token } = pending else {
+            self.pending_logins.insert(name, pending);
+            return;
+        };
+        match client.sign_in(&token, code.trim()).await {
+            Ok(user) => self.finish_login(name, phone, client, pool, user).await,
+            Err(SignInError::PasswordRequired(password_token)) => {
+                self.pending_logins.insert(
+                    name.clone(),
+                    PendingLogin::AwaitingPassword { client, pool, phone, token: password_token },
+                );
+                self.emit(Evt::Login { name, state: LoginEvt::NeedPassword });
+            }
+            Err(SignInError::InvalidCode) => {
+                self.pending_logins.insert(
+                    name.clone(),
+                    PendingLogin::AwaitingCode { client, pool, phone, token },
+                );
+                self.emit(Evt::Login { name, state: LoginEvt::Failed("invalid code — try again".into()) });
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                telegram::shutdown(client, pool).await;
+                self.emit(Evt::Login { name, state: LoginEvt::Failed(msg) });
+            }
+        }
+    }
+
+    async fn submit_password(&mut self, name: String, password: String) {
+        let Some(pending) = self.pending_logins.remove(&name) else { return };
+        let PendingLogin::AwaitingPassword { client, pool, phone, token } = pending else {
+            self.pending_logins.insert(name, pending);
+            return;
+        };
+        match client.check_password(token, password.as_bytes()).await {
+            Ok(user) => self.finish_login(name, phone, client, pool, user).await,
+            Err(SignInError::InvalidPassword(password_token)) => {
+                self.pending_logins.insert(
+                    name.clone(),
+                    PendingLogin::AwaitingPassword { client, pool, phone, token: password_token },
+                );
+                self.emit(Evt::Login { name, state: LoginEvt::Failed("wrong 2FA password".into()) });
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                telegram::shutdown(client, pool).await;
+                self.emit(Evt::Login { name, state: LoginEvt::Failed(msg) });
+            }
+        }
+    }
+
+    async fn finish_login(
+        &mut self,
+        name: String,
+        phone: String,
+        client: Client,
+        pool: tokio::task::JoinHandle<()>,
+        user: grammers_client::peer::User,
+    ) {
+        self.persist_login(&name, &phone, &user);
+        // Drop this throwaway RPC-only connection; bring the account online
+        // properly so dialogs + the update stream come up together.
+        telegram::shutdown(client, pool).await;
+        self.emit(Evt::Login { name: name.clone(), state: LoginEvt::Done });
+        self.broadcast_config();
+        self.bring_online(name).await;
+    }
+
+    async fn stop_updates(conn: &mut AccountConn) {
+        if let Some(stop) = conn.stop_updates.take() { let _ = stop.send(()); }
+        if let Some(mut task) = conn.updates_task.take() {
+            if tokio::time::timeout(Duration::from_secs(3), &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    async fn disconnect_account(&mut self, name: &str) {
+        if let Some(mut conn) = self.conns.remove(name) {
+            Self::stop_updates(&mut conn).await;
+            telegram::shutdown(conn.client, conn.pool).await;
+        }
+    }
+
+    async fn logout(&mut self, name: String) {
+        if self.cfg.find_account(&name).is_some_and(|a| !a.enabled) {
+            self.emit(Evt::Toast(format!("[{name}] Enable this account before signing out on Telegram")));
+            return;
+        }
+        if let Some(mut conn) = self.conns.remove(&name) {
+            Self::stop_updates(&mut conn).await;
+            match conn.client.sign_out().await {
+                Ok(_) => log_info_toast(self, format!("[{name}] signed out on Telegram")),
+                Err(e) => {
+                    log_warn!("[{name}] sign_out RPC failed: {e}");
+                    self.emit(Evt::Toast(format!("[{name}] sign-out RPC failed ({e}); removed locally anyway")));
+                }
+            }
+            telegram::shutdown(conn.client, conn.pool).await;
+        }
+        self.wipe_local(&name);
+    }
+
+    async fn remove_local(&mut self, name: String) {
+        self.disconnect_account(&name).await;
+        self.wipe_local(&name);
+    }
+
+    fn wipe_local(&mut self, name: &str) {
+        let session = util::session_path(&self.data_dir, name);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", session.display()));
+            let _ = std::fs::remove_file(path);
+        }
+        self.cfg.remove_account(name);
+        if let Err(e) = self.cfg.save(&self.data_dir) {
+            log_err!("failed to save config: {e}");
+        }
+        self.broadcast_config();
+        self.emit(Evt::Toast(format!("[{name}] removed from this client")));
+    }
+
+    fn set_local_premium(&mut self, flag: Option<String>, on: bool) {
+        match flag {
+            None => self.cfg.local_premium.set_all(on),
+            Some(key) => {
+                if !self.cfg.local_premium.set_named(&key, on) {
+                    self.emit(Evt::Toast(format!("unknown premium flag '{key}'")));
+                    return;
+                }
+            }
+        }
+        if let Err(e) = self.cfg.save(&self.data_dir) {
+            self.emit(Evt::Toast(format!("failed to save premium settings: {e}")));
+            return;
+        }
+        self.broadcast_config();
+    }
+
+    fn set_alarm_enabled(&mut self, enabled: bool, request_id: u64) {
+        // Keep the new setting in memory even if saving fails: a user who
+        // switched the alarm off must not have it unexpectedly restart.
+        self.cfg.alarm_enabled = enabled;
+        let result = self.cfg.save(&self.data_dir).map_err(|e| e.to_string());
+        self.emit(Evt::AlarmSettingSaved { request_id, result });
+    }
+
+    fn set_account_alarm(&mut self, name: String, enabled: bool, request_id: u64) {
+        let result = if let Some(account) = self.cfg.find_account_mut(&name) {
+            account.alarm_enabled = enabled;
+            self.cfg.save(&self.data_dir).map_err(|e| e.to_string())
+        } else { Err("account no longer exists".into()) };
+        self.emit(Evt::AccountSettingSaved { name, connection: false, request_id, result });
+    }
+
+    async fn set_account_enabled(&mut self, name: String, enabled: bool, request_id: u64) {
+        let result = if let Some(account) = self.cfg.find_account_mut(&name) {
+            account.enabled = enabled;
+            self.cfg.save(&self.data_dir).map_err(|e| e.to_string())
+        } else {
+            self.emit(Evt::AccountSettingSaved { name, connection: true, request_id, result: Err("account no longer exists".into()) });
+            return;
+        };
+        if enabled {
+            self.bring_online(name.clone()).await;
+        } else {
+            self.disconnect_account(&name).await;
+            self.emit(Evt::Status { name: name.clone(), status: ConnStatus::Disabled });
+        }
+        self.emit(Evt::AccountSettingSaved { name, connection: true, request_id, result });
+    }
+
+    fn save_creds(&mut self, api_id: i32, api_hash: String) {
+        self.cfg.api_id = Some(api_id);
+        self.cfg.api_hash = Some(api_hash);
+        if let Err(e) = self.cfg.save(&self.data_dir) {
+            self.emit(Evt::Toast(format!("failed to save credentials: {e}")));
+            return;
+        }
+        self.emit(Evt::Toast("API credentials saved — connecting accounts…".into()));
+        self.broadcast_config();
+    }
+
+    async fn run(mut self, mut cmd_rx: UnboundedReceiver<Cmd>) {
+        // Announce the starting config right away.
+        self.broadcast_config();
+        // Disabled accounts remain registered without opening their sessions.
+        let names: Vec<String> = self.cfg.accounts.iter().filter(|a| a.enabled).map(|a| a.name.clone()).collect();
+        for name in names {
+            // Each connection is independent; failures are reported per account.
+            self.bring_online(name).await;
+        }
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                Cmd::SaveCreds { api_id, api_hash } => {
+                    self.save_creds(api_id, api_hash);
+                    // Any account without a live connection gets one now.
+                    let missing: Vec<String> = self
+                        .cfg
+                        .accounts
+                        .iter()
+                        .filter(|a| a.enabled)
+                        .map(|a| a.name.clone())
+                        .filter(|n| !self.conns.contains_key(n))
+                        .collect();
+                    for name in missing {
+                        self.bring_online(name).await;
+                    }
+                }
+                Cmd::RefreshDialogs { account, request_id } => self.refresh_dialogs(&account, Some(request_id)).await,
+                Cmd::StashPeer { account, peer } => {
+                    if let Some(conn) = self.conns.get_mut(&account) { conn.peer_refs.insert(peer.id, peer); }
+                }
+                Cmd::OpenChat { account, peer_id } => self.fetch_history(&account, peer_id).await,
+                Cmd::MarkRead { account, peer_id, max_id } => self.mark_read(&account, peer_id, max_id).await,
+                Cmd::DeleteMessage { account, peer_id, msg_id } => self.delete_message(&account, peer_id, msg_id).await,
+                Cmd::EditMessage { account, peer_id, msg_id, text, request_id } => self.edit_message(&account, peer_id, msg_id, text, request_id).await,
+                Cmd::SendText { account, peer_id, text, reply_to } => {
+                    self.send_text(&account, peer_id, text, reply_to).await
+                }
+                Cmd::SendPhoto { account, peer_id, path, caption, reply_to } => {
+                    self.send_photo(&account, peer_id, path, caption, reply_to).await
+                }
+                Cmd::ForwardMessage { account, source, destination, msg_id, request_id } => self.forward_message(&account, source, destination, msg_id, request_id).await,
+                Cmd::React { account, peer_id, msg_id, reactions } => self.react(&account, peer_id, msg_id, reactions).await,
+                Cmd::OpenVideo { account, peer_id, msg_id, cache_key } => {
+                    self.open_video(&account, peer_id, msg_id, cache_key).await
+                }
+                Cmd::StashMedia { cache_key, media } => {
+                    if self.media_objects.len() >= 96 {
+                        self.media_objects.clear();
+                    }
+                    self.media_objects.insert(cache_key, media);
+                }
+                Cmd::BeginLogin { name, phone } => self.begin_login(name, phone).await,
+                Cmd::SubmitCode { name, code } => self.submit_code(name, code).await,
+                Cmd::SubmitPassword { name, password } => self.submit_password(name, password).await,
+                Cmd::Logout { name } => self.logout(name).await,
+                Cmd::RemoveLocal { name } => self.remove_local(name).await,
+                Cmd::SetLocalPremium { flag, on } => self.set_local_premium(flag, on),
+                Cmd::SetAlarmEnabled { enabled, request_id } => self.set_alarm_enabled(enabled, request_id),
+                Cmd::SetAccountAlarm { name, enabled, request_id } => self.set_account_alarm(name, enabled, request_id),
+                Cmd::SetAccountEnabled { name, enabled, request_id } => self.set_account_enabled(name, enabled, request_id).await,
+            }
+        }
+    }
+}
+
+fn log_info_toast(worker: &Worker, msg: String) {
+    crate::log_info!("{msg}");
+    worker.emit(Evt::Toast(msg));
+}
+
+fn spawn_worker(
+    data_dir: PathBuf,
+    cmd_rx: UnboundedReceiver<Cmd>,
+    evt_tx: std_mpsc::Sender<Evt>,
+    ctx: egui::Context,
+) {
+    std::thread::Builder::new()
+        .name("mlxysftele-worker".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = evt_tx.send(Evt::Toast(format!("failed to start tokio runtime: {e}")));
+                    return;
+                }
+            };
+            let cfg = Config::load(&data_dir).unwrap_or_else(|_| Config::default());
+            let worker = Worker { data_dir, cfg, evt_tx, ctx, conns: HashMap::new(), pending_logins: HashMap::new(), media_objects: HashMap::new() };
+            rt.block_on(worker.run(cmd_rx));
+        })
+        .expect("failed to spawn worker thread");
+}
+
+// ---------------------------------------------------------------------------
+// GUI side (egui immediate mode, main thread)
+// ---------------------------------------------------------------------------
+
+pub fn run(data_dir: PathBuf) -> Result<(), telegram::BoxError> {
+    let (cmd_tx, cmd_rx) = unbounded_channel::<Cmd>();
+    let (evt_tx, evt_rx) = std_mpsc::channel::<Evt>();
+    let cfg = Config::load(&data_dir).unwrap_or_default();
+    let show_add = cfg.accounts.is_empty();
+    let options = eframe::NativeOptions {
+        // Like ZapFast, draw native egui widgets with Glow rather than wgpu.
+        renderer: eframe::Renderer::Glow,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1120.0, 730.0])
+            .with_min_inner_size([880.0, 560.0])
+            .with_title("mlxysftele"),
+        ..Default::default()
+    };
+    let data_dir_worker = data_dir.clone();
+    eframe::run_native(
+        "mlxysftele",
+        options,
+        Box::new(move |cc| {
+            spawn_worker(data_dir_worker, cmd_rx, evt_tx, cc.egui_ctx.clone());
+            Ok(Box::new(TelegramApp::new(
+                cfg,
+                cmd_tx,
+                evt_rx,
+                data_dir.clone(),
+                show_add,
+                cc.egui_ctx.clone(),
+            )))
+        }),
+    )
+    .map_err(|e| format!("{e}").into())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddStep {
+    Form,
+    Code,
+    Password,
+}
+
+#[derive(Default)]
+struct AddAccountDraft {
+    name: String,
+    phone: String,
+    code: String,
+    password: String,
+    error: Option<String>,
+    busy: bool,
+    step: Option<AddStep>,
+}
+
+struct TelegramApp {
+    cfg: Config,
+    cmd_tx: UnboundedSender<Cmd>,
+    evt_rx: std_mpsc::Receiver<Evt>,
+    data_dir: PathBuf,
+    ctx: egui::Context,
+    /// Decoded inline images, keyed by account, peer, message and media identity.
+    textures: HashMap<String, egui::TextureHandle>,
+    /// Images whose download or decode failed (don't spin forever).
+    failed_media: std::collections::HashSet<String>,
+    /// An image staged but not yet sent (composer attachment).
+    pending_attachment: Option<PathBuf>,
+    /// Full-screen image viewer, if open.
+    viewer: Option<ViewerState>,
+    /// Embedded video player (libmpv), if any.
+    video: Option<VideoPlayer>,
+    /// Set when the user tapped a video that is not yet downloaded; holds the
+    /// cache_key we're waiting on.
+    pending_video_open: Option<String>,
+    show_picker: bool,
+    picker_dir: PathBuf,
+    picker_entries: Vec<(String, PathBuf, bool, u64)>,
+    picker_err: Option<String>,
+    picker_show_all: bool,
+    sel_account: Option<String>,
+    status: HashMap<String, ConnStatus>,
+    me: HashMap<String, MeInfo>,
+    dialogs: HashMap<String, Vec<DialogItem>>,
+    live_dialogs: HashMap<(String, PeerId), LiveDialog>,
+    dialog_refresh: HashMap<String, DialogRefresh>,
+    next_refresh_id: u64,
+    window_focused: bool,
+    filter: String,
+    sel_peer: HashMap<String, PeerId>,
+    chats: HashMap<(String, PeerId), Vec<MsgItem>>,
+    history_pending: HashMap<(String, PeerId), Vec<HistoryChange>>,
+    history_reload_after: std::collections::HashSet<(String, PeerId)>,
+    reply_draft: Option<ReplyDraft>,
+    edit_draft: Option<EditDraft>,
+    next_edit_id: u64,
+    failed_sends: HashMap<(String, PeerId), Vec<SendDraft>>,
+    forward_draft: Option<ForwardDraft>,
+    next_forward_id: u64,
+    reaction_input: String,
+    pending_reactions: std::collections::HashSet<(String, PeerId, i32)>,
+    reaction_versions: HashMap<(String, PeerId, i32), Instant>,
+    unread_refresh_after: HashMap<String, Instant>,
+    confirm_delete: Option<(String, PeerId, i32)>,
+    deleting: std::collections::HashSet<(String, PeerId, i32)>,
+    unread: Unread,
+    notifications: Notifications,
+    notify_retry: HashMap<String, Instant>,
+    pending_reads: HashMap<(String, PeerId), i32>,
+    last_read_attempt: HashMap<(String, PeerId), Instant>,
+    alarm: Alarm,
+    alarm_enabled: bool,
+    alarm_request_id: u64,
+    pending_alarm_request: Option<u64>,
+    alarm_save_error: Option<String>,
+    next_account_setting_id: u64,
+    pending_account_settings: HashMap<(String, bool), u64>,
+    account_setting_errors: HashMap<(String, bool), String>,
+    alarm_errors: std_mpsc::Receiver<String>,
+    composer: String,
+    toast: Option<(String, Instant)>,
+    show_settings: bool,
+    show_add: bool,
+    add: AddAccountDraft,
+    api_id_draft: String,
+    api_hash_draft: String,
+    confirm_remove: Option<String>,
+    confirm_logout: Option<String>,
+}
+
+impl TelegramApp {
+    fn new(
+        cfg: Config,
+        cmd_tx: UnboundedSender<Cmd>,
+        evt_rx: std_mpsc::Receiver<Evt>,
+        data_dir: PathBuf,
+        show_add: bool,
+        ctx: egui::Context,
+    ) -> Self {
+        let alarm_enabled = cfg.alarm_enabled;
+        let api_id_draft = cfg.api_id.map(|id| id.to_string()).unwrap_or_default();
+        let api_hash_draft = cfg.api_hash.clone().unwrap_or_default();
+        let (alarm_tx, alarm_errors) = std_mpsc::channel();
+        let alarm_ctx = ctx.clone();
+        let alarm = Alarm::new(move |error| {
+            let _ = alarm_tx.send(error);
+            alarm_ctx.request_repaint();
+        });
+        let mut app = Self {
+            cfg,
+            cmd_tx,
+            evt_rx,
+            data_dir,
+            sel_account: None,
+            status: HashMap::new(),
+            me: HashMap::new(),
+            dialogs: HashMap::new(),
+            live_dialogs: HashMap::new(),
+            dialog_refresh: HashMap::new(),
+            next_refresh_id: 0,
+            window_focused: false,
+            filter: String::new(),
+            sel_peer: HashMap::new(),
+            chats: HashMap::new(),
+            history_pending: HashMap::new(),
+            history_reload_after: std::collections::HashSet::new(),
+            reply_draft: None,
+            edit_draft: None,
+            next_edit_id: 0,
+            failed_sends: HashMap::new(),
+            forward_draft: None,
+            next_forward_id: 0,
+            reaction_input: String::new(),
+            pending_reactions: std::collections::HashSet::new(),
+            reaction_versions: HashMap::new(),
+            unread_refresh_after: HashMap::new(),
+            confirm_delete: None,
+            deleting: std::collections::HashSet::new(),
+            unread: Unread::default(),
+            notifications: Notifications::default(),
+            notify_retry: HashMap::new(),
+            pending_reads: HashMap::new(),
+            last_read_attempt: HashMap::new(),
+            alarm,
+            alarm_enabled,
+            alarm_request_id: 0,
+            pending_alarm_request: None,
+            alarm_save_error: None,
+            next_account_setting_id: 0,
+            pending_account_settings: HashMap::new(),
+            account_setting_errors: HashMap::new(),
+            alarm_errors,
+            composer: String::new(),
+            toast: None,
+            show_settings: false,
+            show_add,
+            add: AddAccountDraft::default(),
+            api_id_draft,
+            api_hash_draft,
+            confirm_remove: None,
+            confirm_logout: None,
+            ctx,
+            textures: HashMap::new(),
+            failed_media: std::collections::HashSet::new(),
+            pending_attachment: None,
+            viewer: None,
+            video: None,
+            pending_video_open: None,
+            show_picker: false,
+            picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            picker_entries: Vec::new(),
+            picker_err: None,
+            picker_show_all: false,
+        };
+        for account in app.cfg.accounts.clone() {
+            app.status.insert(account.name.clone(), if account.enabled { ConnStatus::Connecting } else { ConnStatus::Disabled });
+            if !account.enabled { app.notifications.set_sync_failed(&account.name, true); }
+        }
+        app.sel_account = app.cfg.accounts.first().map(|a| a.name.clone());
+        app
+    }
+
+    fn apply_event(&mut self, evt: Evt) {
+        match evt {
+            Evt::Config(mut cfg) => {
+                // In-flight optimistic toggles take precedence over older config snapshots.
+                for account in &mut cfg.accounts {
+                    if let Some(current) = self.cfg.find_account(&account.name) {
+                        if self.pending_account_settings.contains_key(&(account.name.clone(), true)) { account.enabled = current.enabled; }
+                        if self.pending_account_settings.contains_key(&(account.name.clone(), false)) { account.alarm_enabled = current.alarm_enabled; }
+                    }
+                }
+                let known: std::collections::HashSet<String> =
+                    cfg.accounts.iter().map(|a| a.name.clone()).collect();
+                self.status.retain(|k, _| known.contains(k));
+                self.pending_account_settings.retain(|(name, _), _| known.contains(name));
+                self.account_setting_errors.retain(|(name, _), _| known.contains(name));
+                self.me.retain(|k, _| known.contains(k));
+                self.dialogs.retain(|k, _| known.contains(k));
+                self.sel_peer.retain(|k, _| known.contains(k));
+                self.live_dialogs.retain(|(a, _), _| known.contains(a));
+                self.dialog_refresh.retain(|a, _| known.contains(a));
+                self.chats.retain(|(a, _), _| known.contains(a));
+                self.history_pending.retain(|(a, _), _| known.contains(a));
+                self.history_reload_after.retain(|(a, _)| known.contains(a));
+                self.failed_sends.retain(|(a, _), _| known.contains(a));
+                self.pending_reactions.retain(|(a, _, _)| known.contains(a));
+                self.reaction_versions.retain(|(a, _, _), _| known.contains(a));
+                if self.reply_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.reply_draft = None; }
+                if self.edit_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.edit_draft = None; }
+                if self.forward_draft.as_ref().is_some_and(|d| !known.contains(&d.account)) { self.forward_draft = None; }
+                self.unread_refresh_after.retain(|a, _| known.contains(a));
+                self.deleting.retain(|(a, _, _)| known.contains(a));
+                if self.confirm_delete.as_ref().is_some_and(|(a, _, _)| !known.contains(a)) { self.confirm_delete = None; }
+                self.unread.retain_accounts(&known);
+                self.notifications.retain_accounts(&known);
+                self.notify_retry.retain(|a, _| known.contains(a));
+                self.pending_reads.retain(|(a, _), _| known.contains(a));
+                self.last_read_attempt.retain(|(a, _), _| known.contains(a));
+                if let Some(sel) = &self.sel_account {
+                    if !known.contains(sel) {
+                        self.sel_account = None;
+                    }
+                }
+                for account in &cfg.accounts {
+                    self.status.entry(account.name.clone()).or_insert(if account.enabled { ConnStatus::Connecting } else { ConnStatus::Disabled });
+                }
+                if self.pending_alarm_request.is_none() {
+                    self.alarm_enabled = cfg.alarm_enabled;
+                }
+                self.cfg = cfg;
+            }
+            Evt::AlarmSettingSaved { request_id, result } => {
+                // Ignore replies from older rapid toggles.
+                if self.pending_alarm_request == Some(request_id) {
+                    self.pending_alarm_request = None;
+                    self.cfg.alarm_enabled = self.alarm_enabled;
+                    match result {
+                        Ok(()) => self.alarm_save_error = None,
+                        Err(error) => {
+                            self.alarm_save_error = Some(error.clone());
+                            self.toast = Some((format!("Alarm setting applies to this session but could not be saved: {error}"), Instant::now()));
+                        }
+                    }
+                }
+            }
+            Evt::AccountSettingSaved { name, connection, request_id, result } => {
+                let key = (name.clone(), connection);
+                if self.pending_account_settings.get(&key) == Some(&request_id) {
+                    self.pending_account_settings.remove(&key);
+                    match result {
+                        Ok(()) => { self.account_setting_errors.remove(&key); }
+                        Err(error) => {
+                            self.account_setting_errors.insert(key, error.clone());
+                            self.toast = Some((format!("[{name}] setting applies this session but could not be saved: {error}"), Instant::now()));
+                        }
+                    }
+                }
+            }
+            Evt::Status { name, status } => {
+                if let Some(account) = self.cfg.find_account(&name) {
+                    if (!account.enabled && status != ConnStatus::Disabled) || (account.enabled && status == ConnStatus::Disabled) { return; }
+                }
+                if status == ConnStatus::Online {
+                    self.dialog_refresh.entry(name.clone()).or_default().last_success = Some(Instant::now());
+                }
+                self.status.insert(name, status);
+            }
+            Evt::Me { name, me } => {
+                self.me.insert(name, me);
+            }
+            Evt::Dialogs { name, mut items, observed } => {
+                for dialog in &items {
+                    // A pre-deletion dialog request must not restore a deleted
+                    // unread high watermark before the post-deletion refresh.
+                    if self.unread_refresh_after.get(&name).is_none_or(|cutoff| observed >= *cutoff) {
+                        self.unread.snapshot(&name, dialog.peer_id, dialog.unread_count, dialog.top_message, dialog.read_inbox_max_id);
+                    }
+                    self.notifications.set_category(&name, dialog.peer_id, dialog.category);
+                    self.notifications.set_peer(&name, dialog.peer_id, dialog.mute_until, observed);
+                }
+                // Overlay live changes received after the snapshot started.
+                // An older or partial snapshot must not hide a newly active chat.
+                let live: Vec<_> = self.live_dialogs.iter().filter(|((a, _), _)| a == &name)
+                    .map(|((_, peer), update)| (*peer, update.clone())).collect();
+                for (peer, update) in live {
+                    let snapshot = items.iter().find(|d| d.peer_id == peer);
+                    let caught_up = snapshot.is_some_and(|d| d.top_message > update.msg.id
+                        || (d.top_message == update.msg.id && observed >= update.observed));
+                    if caught_up {
+                        self.live_dialogs.remove(&(name.clone(), peer));
+                    } else {
+                        let old = self.dialogs.get(&name).and_then(|rows| rows.iter().find(|d| d.peer_id == peer)).cloned();
+                        update_dialog_row(&mut items, peer, &update.msg, update.name.as_deref(), old);
+                    }
+                }
+                let selected = if self.sel_account.as_deref() == Some(name.as_str()) { self.sel_peer.get(&name).copied() } else { None };
+                let needs_history = selected.is_some_and(|peer| {
+                    let row = items.iter().find(|d| d.peer_id == peer && d.resolved);
+                    let latest_cached = self.chats.get(&(name.clone(), peer))
+                        .map(|chat| chat.iter().map(|msg| msg.id).max().unwrap_or(0));
+                    row.is_some_and(|row| latest_cached.is_none_or(|id| id != row.top_message))
+                });
+                self.dialogs.insert(name.clone(), items);
+                if needs_history { self.request_history(name, selected.unwrap()); }
+            }
+            Evt::DialogsComplete { account, request_id, successful } => {
+                let state = self.dialog_refresh.entry(account.clone()).or_default();
+                if request_id.is_some() && state.pending != request_id { return; }
+                if request_id.is_some() { state.pending = None; }
+                state.failed = !successful;
+                if successful {
+                    state.last_success = Some(Instant::now());
+                    state.retry_at = None;
+                } else {
+                    state.dirty = true;
+                    state.retry_at = Some(Instant::now() + REFRESH_RETRY);
+                }
+                self.ctx.request_repaint();
+            }
+            Evt::NotifyPeer { account, peer_id, until, observed } => {
+                self.notifications.set_peer(&account, peer_id, until, observed);
+            }
+            Evt::NotifySyncError { account, message } => {
+                self.notifications.set_sync_failed(&account, true);
+                self.notify_retry.insert(account, Instant::now() + Duration::from_secs(30));
+                self.toast = Some((format!("Could not load chats; alarm may be delayed: {message}"), Instant::now()));
+            }
+            Evt::NotifySyncComplete { account, successful } => {
+                if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) { return; }
+                if successful {
+                    self.notifications.set_sync_failed(&account, false);
+                    self.notify_retry.remove(&account);
+                }
+            }
+            Evt::NotifyDefault { account, category, result, observed } => {
+                match result {
+                    Ok(until) => {
+                        self.notifications.set_default(&account, category, until, observed);
+                    }
+                    Err(error) => {
+                        self.notifications.set_sync_failed(&account, true);
+                        self.notify_retry.insert(account, Instant::now() + Duration::from_secs(30));
+                        self.toast = Some((format!("Could not load notification settings; alarm may be delayed: {error}"), Instant::now()));
+                    }
+                }
+            }
+            Evt::History { account, peer_id, mut messages } => {
+                let key = (account, peer_id);
+                if let Some(changes) = self.history_pending.remove(&key) {
+                    for change in &changes { apply_history_change(&mut messages, change); }
+                }
+                if messages.len() > MAX_CACHED_MESSAGES {
+                    let excess = messages.len() - MAX_CACHED_MESSAGES;
+                    messages.drain(..excess);
+                }
+                self.reaction_versions.retain(|(a, peer, id), _| {
+                    (a != &key.0 || *peer != key.1) || messages.iter().any(|message| message.id == *id)
+                        || self.pending_reactions.contains(&(a.clone(), *peer, *id))
+                });
+                let reload = self.history_reload_after.remove(&key);
+                self.chats.insert(key.clone(), messages);
+                if reload { self.request_history(key.0, key.1); }
+            }
+            Evt::HistoryFailed { account, peer_id, message } => {
+                let key = (account, peer_id);
+                self.history_pending.remove(&key);
+                self.toast = Some((format!("history failed: {message}"), Instant::now()));
+                if self.history_reload_after.remove(&key) { self.request_history(key.0, key.1); }
+            }
+            Evt::Incoming { account, peer_id, msg, peer_name, peer_ref } => {
+                let outgoing = msg.outgoing;
+                let message_id = msg.id;
+                self.update_live_dialog(&account, peer_id, &msg, peer_name);
+                if let Some(peer) = peer_ref {
+                    self.send_cmd(Cmd::StashPeer { account: account.clone(), peer });
+                    if let Some(row) = self.dialogs.get_mut(&account).and_then(|rows| rows.iter_mut().find(|row| row.peer_id == peer_id)) {
+                        row.resolved = true;
+                    }
+                    if self.sel_account.as_deref() == Some(account.as_str()) && self.sel_peer.get(&account) == Some(&peer_id)
+                        && !self.chats.contains_key(&(account.clone(), peer_id)) {
+                        self.request_history(account.clone(), peer_id);
+                    }
+                }
+                self.record_chat_change(&account, peer_id, HistoryChange::New(msg));
+                // A history fetch can populate the message before its live
+                // update arrives. Deduplicate unread independently of the
+                // chat cache; the unread tracker has its own read watermark.
+                if !outgoing {
+                    self.unread.incoming(&account, peer_id, message_id);
+                }
+                self.request_dialog_refresh(&account);
+            }
+            Evt::Edited { account, peer_id, msg } => {
+                if let Some(draft) = &mut self.edit_draft {
+                    if draft.account == account && draft.peer_id == peer_id && draft.msg_id == msg.id && draft.request_id.is_none() && msg.text != draft.original {
+                        draft.changed_remotely = true;
+                    }
+                }
+                if self.dialogs.get(&account).is_some_and(|rows| rows.iter().any(|d| d.peer_id == peer_id && d.top_message == msg.id)) {
+                    self.update_live_dialog(&account, peer_id, &msg, None);
+                }
+                self.record_chat_change(&account, peer_id, HistoryChange::Edit(msg));
+                self.request_dialog_refresh(&account);
+            }
+            Evt::Deleted { account, channel, ids } => {
+                use grammers_session::types::PeerKind;
+                // Ordinary message IDs share one account-wide namespace; channel
+                // message IDs are scoped to the channel, never to other peers.
+                let keys: std::collections::HashSet<_> = self.chats.keys().chain(self.history_pending.keys())
+                    .filter(|(a, peer)| a == &account && match channel {
+                        Some(channel) => *peer == channel,
+                        None => peer.kind() != PeerKind::Channel,
+                    }).cloned().collect();
+                for (_, peer) in keys { self.record_chat_change(&account, peer, HistoryChange::Delete(ids.clone())); }
+                self.unread.deleted(&account, channel, &ids);
+                if self.edit_draft.as_ref().is_some_and(|d| d.account == account && ids.contains(&d.msg_id) && match channel {
+                    Some(channel) => d.peer_id == channel,
+                    None => d.peer_id.kind() != PeerKind::Channel,
+                }) {
+                    self.edit_draft = None;
+                    self.toast = Some(("Message was deleted; edit closed".into(), Instant::now()));
+                }
+                if self.reply_draft.as_ref().is_some_and(|d| d.account == account && ids.contains(&d.msg_id) && match channel {
+                    Some(channel) => d.peer_id == channel,
+                    None => d.peer_id.kind() != PeerKind::Channel,
+                }) { self.reply_draft = None; }
+                self.reaction_versions.retain(|(a, peer, id), _| !(a == &account && ids.contains(id) && match channel {
+                    Some(channel) => *peer == channel,
+                    None => peer.kind() != PeerKind::Channel,
+                }));
+                self.live_dialogs.retain(|(a, peer), live| !(a == &account && ids.contains(&live.msg.id) && match channel {
+                    Some(channel) => *peer == channel,
+                    None => peer.kind() != PeerKind::Channel,
+                }));
+                self.unread_refresh_after.insert(account.clone(), Instant::now());
+                self.request_dialog_refresh(&account);
+            }
+            Evt::DeleteResult { account, peer_id, msg_id, result } => {
+                self.deleting.remove(&(account.clone(), peer_id, msg_id));
+                match result {
+                    Ok(()) => {
+                        self.record_chat_change(&account, peer_id, HistoryChange::Delete(vec![msg_id]));
+                        self.unread.deleted_from_peer(&account, peer_id, &[msg_id]);
+                        if self.reply_draft.as_ref().is_some_and(|d| d.account == account && d.peer_id == peer_id && d.msg_id == msg_id) { self.reply_draft = None; }
+                        if self.edit_draft.as_ref().is_some_and(|d| d.account == account && d.peer_id == peer_id && d.msg_id == msg_id) { self.edit_draft = None; }
+                        self.reaction_versions.remove(&(account.clone(), peer_id, msg_id));
+                        self.unread_refresh_after.insert(account.clone(), Instant::now());
+                        self.live_dialogs.remove(&(account.clone(), peer_id));
+                        self.request_dialog_refresh(&account);
+                    }
+                    Err(e) => self.toast = Some((format!("Could not delete for everyone: {e}"), Instant::now())),
+                }
+            }
+            Evt::EditResult { account, peer_id, msg_id, request_id, result } => {
+                let matches = self.edit_draft.as_ref().is_some_and(|d| d.account == account && d.peer_id == peer_id && d.msg_id == msg_id && d.request_id == Some(request_id));
+                match result {
+                    Ok(()) => {
+                        if matches { self.edit_draft = None; }
+                        // The edit RPC can return updates without feeding our update stream.
+                        // Reconcile against Telegram rather than overwriting newer remote edits.
+                        let key = (account.clone(), peer_id);
+                        if self.history_pending.contains_key(&key) { self.history_reload_after.insert(key); }
+                        else { self.request_history(account.clone(), peer_id); }
+                        self.request_dialog_refresh(&account);
+                        self.toast = Some(("Message edited".into(), Instant::now()));
+                    }
+                    Err(error) => {
+                        if matches { if let Some(draft) = &mut self.edit_draft { draft.request_id = None; draft.error = Some(error.clone()); } }
+                        self.toast = Some((format!("Edit failed: {error}"), Instant::now()));
+                    }
+                }
+            }
+            Evt::Reactions { account, peer_id, msg_id, reactions, minimal } => {
+                let key = (account.clone(), peer_id);
+                if self.history_pending.contains_key(&key) || self.chats.get(&key).is_some_and(|chat| chat.iter().any(|msg| msg.id == msg_id)) {
+                    self.reaction_versions.insert((account.clone(), peer_id, msg_id), Instant::now());
+                }
+                self.record_chat_change(&account, peer_id, HistoryChange::Reactions { msg_id, reactions, minimal });
+            }
+            Evt::ReactionResult { account, peer_id, msg_id, observed, result } => {
+                let key = (account.clone(), peer_id, msg_id);
+                self.pending_reactions.remove(&key);
+                match result {
+                    Err(error) => self.toast = Some((format!("Reaction failed: {error}"), Instant::now())),
+                    Ok(reactions) => {
+                        let newer = self.reaction_versions.get(&key).is_some_and(|t| *t > observed);
+                        if let Some((reactions, minimal)) = reactions.filter(|_| !newer) {
+                            self.reaction_versions.insert(key, Instant::now());
+                            self.record_chat_change(&account, peer_id, HistoryChange::Reactions { msg_id, reactions, minimal });
+                        } else {
+                            // A concurrent update or a failed read-back needs a fresh snapshot.
+                            let key = (account.clone(), peer_id);
+                            if self.history_pending.contains_key(&key) { self.history_reload_after.insert(key); }
+                            else { self.request_history(account, peer_id); }
+                        }
+                    }
+                }
+            }
+            Evt::ForwardResult { account, destination, request_id, result } => {
+                let matches_draft = self.forward_draft.as_ref().is_some_and(|d| d.request_id == Some(request_id));
+                if matches_draft { if let Some(draft) = &mut self.forward_draft { draft.request_id = None; } }
+                match result {
+                    Err(error) => self.toast = Some((format!("Forward failed: {error}"), Instant::now())),
+                    Ok(message) => {
+                        if matches_draft { self.forward_draft = None; }
+                        if let Some(message) = message {
+                            self.update_live_dialog(&account, destination, &message, None);
+                            self.record_chat_change(&account, destination, HistoryChange::New(message));
+                        }
+                        // Re-fetch destination history for media handles and unknown IDs.
+                        let key = (account.clone(), destination);
+                        if self.history_pending.contains_key(&key) { self.history_reload_after.insert(key); }
+                        else if self.chats.contains_key(&key) { self.request_history(account.clone(), destination); }
+                        self.request_dialog_refresh(&account);
+                        self.toast = Some(("Forward request sent".into(), Instant::now()));
+                    }
+                }
+            }
+            Evt::Sent { account, peer_id, result, source_path, draft } => match result {
+                Ok(msg) => {
+                    // A photo we just sent: cache the local file for rendering.
+                    if let Some(src) = source_path {
+                        let key = media_cache_key(&account, peer_id, msg.id, msg.media_token.as_deref());
+                        let _ = self.decode_into_textures(&key, &src);
+                        // Clear the staged attachment only if it is the one we sent.
+                        if self.pending_attachment.as_deref() == Some(src.as_path()) {
+                            self.pending_attachment = None;
+                        }
+                    }
+                    self.update_live_dialog(&account, peer_id, &msg, None);
+                    self.record_chat_change(&account, peer_id, HistoryChange::New(msg));
+                    self.request_dialog_refresh(&account);
+                    // If the chat was not open the user will re-fetch history on next open.
+                }
+                Err(e) => {
+                    self.failed_sends.entry((account, peer_id)).or_default().push(draft);
+                    self.toast = Some((format!("Send failed: {e}. Restore the draft in that chat to retry."), Instant::now()));
+                }
+            },
+            Evt::StashMedia { cache_key, media } => {
+                // Echo back to the worker; it owns the raw Media handles.
+                self.send_cmd(Cmd::StashMedia { cache_key, media });
+            }
+            Evt::MediaReady { cache_key, path, kind, .. } => {
+                match kind {
+                    MsgMedia::Video(_) => {
+                        if self.pending_video_open.as_deref() == Some(cache_key.as_str()) {
+                            self.pending_video_open = None;
+                            if path.as_os_str().is_empty() {
+                                self.toast = Some(("video download failed".into(), Instant::now()));
+                            } else {
+                                let title = path
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "video".to_string());
+                                match VideoPlayer::open(&path, &title) {
+                                    Ok(player) => self.video = Some(player),
+                                    Err(e) => {
+                                        self.toast = Some((format!("video failed: {e}"), Instant::now()))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if path.as_os_str().is_empty() {
+                            self.failed_media.insert(cache_key);
+                            return;
+                        }
+                        self.decode_into_textures(&cache_key, &path);
+                    }
+                }
+            }
+            Evt::ReadUpdate { account, peer_id, max_id, remaining } => {
+                self.unread.read(&account, peer_id, max_id, Some(remaining));
+                if remaining > 0 {
+                    self.request_dialog_refresh(&account);
+                }
+            }
+            Evt::ReadResult { account, peer_id, max_id, result } => {
+                self.pending_reads.remove(&(account.clone(), peer_id));
+                match result {
+                    Ok(()) => self.unread.read(&account, peer_id, max_id, None),
+                    Err(error) => self.toast = Some((format!("Could not mark chat read: {error}"), Instant::now())),
+                }
+            }
+            Evt::VideoError { cache_key, message } => {
+                if self.pending_video_open.as_deref() == Some(cache_key.as_str()) {
+                    self.pending_video_open = None;
+                    self.toast = Some((message, Instant::now()));
+                }
+            }
+            Evt::Login { name, state } => match state {
+                LoginEvt::NeedCode => {
+                    if self.add.name == name {
+                        self.add.step = Some(AddStep::Code);
+                        self.add.busy = false;
+                        self.add.error = None;
+                        self.add.code.clear();
+                    } else {
+                        self.toast = Some((format!("[{name}] login code requested"), Instant::now()));
+                    }
+                }
+                LoginEvt::NeedPassword => {
+                    if self.add.name == name {
+                        self.add.step = Some(AddStep::Password);
+                        self.add.busy = false;
+                        self.add.error = None;
+                        self.add.password.clear();
+                    }
+                }
+                LoginEvt::Done => {
+                    if self.add.name == name {
+                        self.toast = Some((format!("account '{name}' is online"), Instant::now()));
+                        self.show_add = false;
+                        self.add = AddAccountDraft::default();
+                    }
+                }
+                LoginEvt::Failed(msg) => {
+                    if self.add.name == name || self.show_add {
+                        self.add.error = Some(msg);
+                        self.add.busy = false;
+                    } else {
+                        self.toast = Some((msg, Instant::now()));
+                    }
+                }
+            },
+            Evt::Toast(msg) => self.toast = Some((msg, Instant::now())),
+        }
+    }
+
+    fn update_live_dialog(&mut self, account: &str, peer_id: PeerId, msg: &MsgItem, name: Option<String>) {
+        let key = (account.to_owned(), peer_id);
+        if self.live_dialogs.get(&key).is_some_and(|old| old.msg.id > msg.id) { return; }
+        let rows = self.dialogs.entry(account.to_owned()).or_default();
+        if rows.iter().any(|row| row.peer_id == peer_id && row.top_message > msg.id) { return; }
+        let old = self.live_dialogs.get(&key).and_then(|v| v.name.clone());
+        let name = name.or(old);
+        update_dialog_row(rows, peer_id, msg, name.as_deref(), None);
+        self.live_dialogs.insert(key, LiveDialog { msg: msg.clone(), observed: Instant::now(), name });
+    }
+
+    fn request_dialog_refresh(&mut self, account: &str) {
+        if self.cfg.find_account(account).is_some_and(|a| !a.enabled) { return; }
+        self.dialog_refresh.entry(account.to_owned()).or_default().dirty = true;
+        self.ctx.request_repaint();
+    }
+
+    /// One request per account at a time. Events during a request leave a dirty
+    /// flag, so a follow-up is always scheduled instead of lost to throttling.
+    fn pump_dialog_refreshes(&mut self, now: Instant) {
+        let mut wait: Option<Duration> = None;
+        for (account, state) in &mut self.dialog_refresh {
+            if self.cfg.find_account(account).is_some_and(|a| !a.enabled) || !state.dirty || state.pending.is_some() { continue; }
+            let cooldown = state.last_request.map(|t| t + REFRESH_COOLDOWN).unwrap_or(now);
+            let due = state.retry_at.unwrap_or(now).max(cooldown);
+            if due > now {
+                let delay = due.duration_since(now);
+                wait = Some(wait.map_or(delay, |old| old.min(delay)));
+                continue;
+            }
+            self.next_refresh_id = self.next_refresh_id.wrapping_add(1);
+            let request_id = self.next_refresh_id;
+            if self.cmd_tx.send(Cmd::RefreshDialogs { account: account.clone(), request_id }).is_ok() {
+                state.pending = Some(request_id);
+                state.dirty = false;
+                state.last_request = Some(now);
+            } else {
+                state.failed = true;
+                state.retry_at = Some(now + REFRESH_RETRY);
+                wait = Some(wait.map_or(REFRESH_RETRY, |old| old.min(REFRESH_RETRY)));
+            }
+        }
+        if let Some(delay) = wait { self.ctx.request_repaint_after(delay); }
+    }
+
+    fn restore_failed_send(&mut self, account: &str, peer_id: PeerId) {
+        if !self.composer.is_empty() || self.pending_attachment.is_some() || self.reply_draft.is_some() { return; }
+        let key = (account.to_owned(), peer_id);
+        let draft = self.failed_sends.get_mut(&key).and_then(|drafts| if drafts.is_empty() { None } else { Some(drafts.remove(0)) });
+        if self.failed_sends.get(&key).is_some_and(Vec::is_empty) { self.failed_sends.remove(&key); }
+        if let Some(draft) = draft {
+            self.composer = draft.text;
+            self.pending_attachment = draft.attachment;
+            if let Some(msg_id) = draft.reply_to {
+                let preview = self.chats.get(&key).and_then(|chat| chat.iter().find(|msg| msg.id == msg_id))
+                    .map(preview_text).unwrap_or_else(|| "Original message unavailable".into());
+                self.reply_draft = Some(ReplyDraft { account: account.to_owned(), peer_id, msg_id, preview });
+            }
+            self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+        }
+    }
+
+    fn react_to_message(&mut self, account: &str, peer_id: PeerId, msg: &MsgItem, kind: ReactionKind) {
+        if kind == ReactionKind::Paid { return; }
+        let key = (account.to_owned(), peer_id, msg.id);
+        if self.pending_reactions.contains(&key) { return; }
+        let mut chosen: Vec<_> = msg.reactions.iter().filter(|reaction| reaction.chosen && reaction.kind != ReactionKind::Paid)
+            .map(|reaction| reaction.kind.clone()).collect();
+        if let Some(index) = chosen.iter().position(|item| *item == kind) { chosen.remove(index); }
+        else { chosen.push(kind); }
+        if self.cmd_tx.send(Cmd::React { account: account.to_owned(), peer_id, msg_id: msg.id, reactions: chosen }).is_ok() {
+            self.pending_reactions.insert(key);
+        } else { self.toast = Some(("Reaction failed: worker stopped".into(), Instant::now())); }
+    }
+
+    fn record_chat_change(&mut self, account: &str, peer_id: PeerId, change: HistoryChange) {
+        let key = (account.to_owned(), peer_id);
+        if let Some(chat) = self.chats.get_mut(&key) { apply_history_change(chat, &change); }
+        if let Some(changes) = self.history_pending.get_mut(&key) { changes.push(change); }
+    }
+
+    fn request_history(&mut self, account: String, peer_id: PeerId) {
+        let key = (account.clone(), peer_id);
+        if self.history_pending.contains_key(&key) { return; }
+        self.history_pending.insert(key.clone(), Vec::new());
+        if self.cmd_tx.send(Cmd::OpenChat { account, peer_id }).is_err() {
+            self.history_pending.remove(&key);
+            self.toast = Some(("history failed: worker stopped".into(), Instant::now()));
+        }
+    }
+
+    fn send_cmd(&self, cmd: Cmd) {
+        let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Apply the global switch immediately; persist it through the worker's
+    /// single-writer config path without delaying the audio stop/start.
+    fn set_alarm_enabled(&mut self, enabled: bool) {
+        self.alarm_enabled = enabled;
+        self.sync_alarm();
+        self.alarm_request_id = self.alarm_request_id.wrapping_add(1);
+        let request_id = self.alarm_request_id;
+        self.pending_alarm_request = Some(request_id);
+        if self.cmd_tx.send(Cmd::SetAlarmEnabled { enabled, request_id }).is_err() {
+            self.pending_alarm_request = None;
+            self.cfg.alarm_enabled = enabled;
+            self.alarm_save_error = Some("worker stopped".into());
+            self.toast = Some(("Alarm setting changed for this session, but could not be saved (worker stopped)".into(), Instant::now()));
+        }
+    }
+
+    fn set_account_setting(&mut self, name: &str, connection: bool, enabled: bool) {
+        let key = (name.to_owned(), connection);
+        if self.pending_account_settings.contains_key(&key) || self.cfg.find_account(name).is_none() { return; }
+        self.next_account_setting_id = self.next_account_setting_id.wrapping_add(1);
+        let request_id = self.next_account_setting_id;
+        let cmd = if connection { Cmd::SetAccountEnabled { name: name.into(), enabled, request_id } }
+            else { Cmd::SetAccountAlarm { name: name.into(), enabled, request_id } };
+        if self.cmd_tx.send(cmd).is_err() {
+            self.account_setting_errors.insert(key, "worker stopped; no change applied".into());
+            self.toast = Some(("Account setting failed: worker stopped".into(), Instant::now()));
+            return;
+        }
+        self.pending_account_settings.insert(key.clone(), request_id);
+        self.account_setting_errors.remove(&key);
+        if let Some(account) = self.cfg.find_account_mut(name) {
+            if connection { account.enabled = enabled; } else { account.alarm_enabled = enabled; }
+        }
+        if connection {
+            self.status.insert(name.to_owned(), if enabled { ConnStatus::Connecting } else { ConnStatus::Disabled });
+            self.notifications.set_sync_failed(name, true);
+            if !enabled { self.notify_retry.remove(name); }
+        }
+        self.sync_alarm();
+    }
+
+    fn sync_alarm(&mut self) {
+        let now = util::now_unix();
+        let active = self.alarm_enabled && self.cfg.accounts.iter().any(|account| {
+            account.enabled && account.alarm_enabled && self.unread.account_counts(&account.name, &self.notifications, now).1 > 0
+        });
+        self.alarm.set_active(active);
+    }
+
+    /// Decode an image file into the texture cache (no-op if already cached).
+    fn decode_into_textures(&mut self, key: &str, path: &std::path::Path) -> bool {
+        if self.textures.contains_key(key) {
+            return true;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => {
+                self.failed_media.insert(key.to_string());
+                return false;
+            }
+        };
+        let img = match image::load_from_memory(&bytes) {
+            Ok(i) => i,
+            Err(_) => {
+                self.failed_media.insert(key.to_string());
+                return false;
+            }
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let handle = self
+            .ctx
+            .load_texture(key.to_string(), image, egui::TextureOptions::default());
+        self.textures.insert(key.to_string(), handle);
+        true
+    }
+
+    fn select_account(&mut self, name: String) {
+        let changed = self.sel_account.as_deref() != Some(name.as_str());
+        self.sel_account = Some(name.clone());
+        self.pending_attachment = None;
+        if changed {
+            self.reply_draft = None;
+            // Switching accounts must not silently read the previously open chat.
+            self.sel_peer.remove(&name);
+            self.ctx.memory_mut(|memory| memory.surrender_focus(composer_id()));
+            self.filter.clear();
+        }
+        if self.sel_peer.contains_key(&name) {
+            self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+        }
+        if self.status.get(&name) == Some(&ConnStatus::Online) {
+            self.request_dialog_refresh(&name);
+        }
+    }
+
+    fn select_peer(&mut self, peer_id: PeerId) {
+        if let Some(account) = self.sel_account.clone() {
+            if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) { return; }
+            if self.sel_peer.get(&account) != Some(&peer_id) { self.reply_draft = None; }
+            self.sel_peer.insert(account.clone(), peer_id);
+            self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+            self.pending_attachment = None;
+            // A re-opened cached chat may have missed changes while hidden.
+            let resolved = self.dialogs.get(&account).and_then(|rows| rows.iter().find(|d| d.peer_id == peer_id)).is_none_or(|d| d.resolved);
+            if resolved { self.request_history(account, peer_id); }
+            else { self.request_dialog_refresh(&account); }
+        }
+    }
+
+    fn selected_peer_name(&self, account: &str, peer_id: PeerId) -> String {
+        self.dialogs
+            .get(account)
+            .and_then(|d| d.iter().find(|d| d.peer_id == peer_id))
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "chat".to_string())
+    }
+}
+
+/// Stable id lets navigation return keyboard focus to the chat composer.
+fn composer_id() -> egui::Id {
+    egui::Id::new("message_composer")
+}
+
+fn is_image_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
+        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff")
+    )
+}
+
+fn premium_flag(t: &PremiumToggles, key: &str) -> bool {
+    match key {
+        "themes" => t.themes,
+        "fast_animations" => t.fast_animations,
+        "sticker_shortcuts" => t.sticker_shortcuts,
+        "hide_sponsored" => t.hide_sponsored,
+        "hidden_premium_nags" => t.hidden_premium_nags,
+        _ => false,
+    }
+}
+
+fn premium_set_local(t: &mut PremiumToggles, key: &str, on: bool) {
+    match key {
+        "themes" => t.themes = on,
+        "fast_animations" => t.fast_animations = on,
+        "sticker_shortcuts" => t.sticker_shortcuts = on,
+        "hide_sponsored" => t.hide_sponsored = on,
+        "hidden_premium_nags" => t.hidden_premium_nags = on,
+        _ => {}
+    }
+}
+
+fn status_color(status: &ConnStatus) -> egui::Color32 {
+    match status {
+        ConnStatus::Disabled => egui::Color32::from_gray(110),
+        ConnStatus::Online => egui::Color32::from_rgb(52, 211, 103),
+        ConnStatus::Connecting => egui::Color32::from_rgb(255, 176, 46),
+        ConnStatus::Unauthorized => egui::Color32::from_rgb(154, 154, 154),
+        ConnStatus::Error(_) => egui::Color32::from_rgb(255, 95, 86),
+    }
+}
+
+fn status_tooltip(status: &ConnStatus) -> String {
+    match status {
+        ConnStatus::Disabled => "disabled locally — session kept; enable in Settings to reconnect".into(),
+        ConnStatus::Online => "connected — this account stays active".into(),
+        ConnStatus::Connecting => "connecting…".into(),
+        ConnStatus::Unauthorized => "session not authorized — remove and re-add the account".into(),
+        ConnStatus::Error(e) => format!("error: {e}"),
+    }
+}
+
+fn avatar_fill(name: &str) -> egui::Color32 {
+    const PALETTE: &[egui::Color32] = &[
+        egui::Color32::from_rgb(88, 101, 242),
+        egui::Color32::from_rgb(235, 69, 158),
+        egui::Color32::from_rgb(0, 168, 132),
+        egui::Color32::from_rgb(255, 126, 27),
+        egui::Color32::from_rgb(83, 189, 235),
+        egui::Color32::from_rgb(255, 99, 71),
+        egui::Color32::from_rgb(156, 89, 209),
+        egui::Color32::from_rgb(31, 158, 137),
+    ];
+    let mut hash: u64 = 1469598103934665603;
+    for b in name.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    PALETTE[(hash % PALETTE.len() as u64) as usize]
+}
+
+fn initials(name: &str) -> String {
+    let mut it = name
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase);
+    let s: String = it.by_ref().collect();
+    if s.is_empty() { "?".into() } else { s }
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+fn format_msg_time(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local))
+        .map(|dt| {
+            let today = chrono::Local::now().date_naive();
+            if dt.date_naive() == today {
+                dt.format("%H:%M").to_string()
+            } else {
+                dt.format("%b %d %H:%M").to_string()
+            }
+        })
+        .unwrap_or_else(|| "?".to_string())
+}
+
+// ---------------- eframe::App implementation ----------------
+
+impl eframe::App for TelegramApp {
+    /// Background logic: drain worker events. No painting here.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(evt) = self.evt_rx.try_recv() {
+            self.apply_event(evt);
+        }
+        while let Ok(error) = self.alarm_errors.try_recv() {
+            self.toast = Some((error, Instant::now()));
+        }
+        let focused = ctx.input(|i| i.focused && i.viewport().visible() != Some(false));
+        if focused && !self.window_focused {
+            if let Some(account) = self.sel_account.clone() { self.request_dialog_refresh(&account); }
+        }
+        self.window_focused = focused;
+        self.mark_visible_chat_read(ctx);
+        let now = util::now_unix();
+        self.sync_alarm();
+        if let Some(expiry) = self.notifications.next_expiry(now) {
+            ctx.request_repaint_after(Duration::from_secs((expiry - now).clamp(1, 3600)));
+        }
+        let retry_accounts: Vec<_> = self.notify_retry.iter().filter(|(_, at)| **at <= Instant::now()).map(|(name, _)| name.clone()).collect();
+        for account in retry_accounts {
+            self.notify_retry.insert(account.clone(), Instant::now() + Duration::from_secs(30));
+            self.request_dialog_refresh(&account);
+        }
+        let now = Instant::now();
+        let periodic: Vec<_> = self.status.iter().filter(|(_, status)| **status == ConnStatus::Online)
+            .filter_map(|(account, _)| {
+                let state = self.dialog_refresh.get(account)?;
+                (state.last_success.is_some_and(|last| now.duration_since(last) >= PERIODIC_REFRESH)
+                    && state.pending.is_none() && !state.dirty).then(|| account.clone())
+            }).collect();
+        for account in periodic { self.request_dialog_refresh(&account); }
+        self.pump_dialog_refreshes(now);
+        if let Some(delay) = self.status.iter().filter(|(_, status)| **status == ConnStatus::Online)
+            .filter_map(|(account, _)| self.dialog_refresh.get(account).and_then(|s| s.last_success))
+            .map(|last| (last + PERIODIC_REFRESH).saturating_duration_since(now))
+            .filter(|delay| !delay.is_zero()).min() {
+            ctx.request_repaint_after(delay);
+        }
+        if !self.notify_retry.is_empty() { ctx.request_repaint_after(Duration::from_secs(30)); }
+        if let Some((_, since)) = &self.toast {
+            if since.elapsed() > Duration::from_secs(6) {
+                self.toast = None;
+            }
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // ESC closes the top-most thing: viewer → picker → settings/add → chat.
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc {
+            if self.confirm_delete.take().is_some() {
+                // deletion cancelled
+            } else if self.edit_draft.as_ref().is_some_and(|draft| draft.request_id.is_none()) {
+                self.edit_draft = None;
+            } else if self.edit_draft.is_some() {
+                // An already submitted edit cannot be cancelled.
+            } else if self.forward_draft.take().is_some() {
+                // forward picker closed (an already sent request may still complete)
+            } else if self.viewer.take().is_some() {
+                // viewer closed
+            } else if self.video.take().is_some() {
+                // video player closed
+            } else if self.show_picker {
+                self.show_picker = false;
+            } else if self.show_settings {
+                self.show_settings = false;
+            } else if self.show_add {
+                self.show_add = false;
+            } else if self.reply_draft.take().is_some() {
+                // reply cancelled
+            } else if let Some(account) = self.sel_account.clone() {
+                // "close the chat" — return to the "pick a chat" screen.
+                self.sel_peer.remove(&account);
+                self.pending_attachment = None;
+            }
+        }
+
+        // Stage an image pasted into the app (Ctrl/Cmd+V with no usable text
+        // on the clipboard — egui-winit emits Event::PasteImage then).
+        let pasted: Vec<egui::ColorImage> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::PasteImage(image) => Some((**image).clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        for image in pasted {
+            match self.stage_pasted_image(&image) {
+                Ok(()) => {
+                    self.toast = Some(("image pasted — press Enter to send".into(), Instant::now()))
+                }
+                Err(e) => self.toast = Some((format!("paste failed: {e}"), Instant::now())),
+            }
+        }
+
+        // Stage an image dropped from the OS onto the window.
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
+        });
+        if let Some(path) = dropped.into_iter().find(|p| is_image_file(p)) {
+            let chat_open = self
+                .sel_account
+                .as_ref()
+                .map(|a| self.sel_peer.get(a).is_some())
+                .unwrap_or(false);
+            if chat_open {
+                self.pending_attachment = Some(path);
+            } else {
+                self.toast = Some(("open a chat first".into(), Instant::now()));
+            }
+        }
+
+        self.ui_topbar(ui);
+
+        egui::Panel::left("account_list")
+            .default_size(232.0)
+            .min_size(180.0)
+            .resizable(true)
+            .show(ui, |ui| self.ui_accounts(ui));
+
+        egui::Panel::left("chat_list")
+            .default_size(296.0)
+            .min_size(220.0)
+            .resizable(true)
+            .show(ui, |ui| self.ui_chats(ui));
+
+        egui::CentralPanel::default().show(ui, |ui| self.ui_chat_view(ui));
+
+        if self.video.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        self.ui_edit_window(ui.ctx());
+        self.ui_forward_window(ui.ctx());
+        self.ui_delete_confirmation(ui.ctx());
+        self.ui_settings_window(ui.ctx());
+        self.ui_add_window(ui.ctx());
+        self.ui_picker_window(ui.ctx());
+        self.ui_viewer(ui.ctx());
+        self.ui_video(ui.ctx());
+        self.ui_toast(ui.ctx());
+    }
+}
+
+impl TelegramApp {
+    /// Only acknowledge messages after their history has loaded in the focused,
+    /// visible window. Do not mark a hidden account/chat or an overlaid chat read.
+    fn mark_visible_chat_read(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.focused && i.viewport().visible() != Some(false))
+            || self.show_settings || self.show_add || self.show_picker || self.viewer.is_some() || self.video.is_some() || self.confirm_delete.is_some() || self.forward_draft.is_some() {
+            return;
+        }
+        let Some(account) = self.sel_account.clone() else { return };
+        if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) { return; }
+        let Some(&peer_id) = self.sel_peer.get(&account) else { return };
+        let key = (account.clone(), peer_id);
+        let Some(history) = self.chats.get(&key) else { return };
+        if self.pending_reads.contains_key(&key) || self.history_pending.contains_key(&key) { return; }
+        let Some(max_id) = self.unread.newest(&account, peer_id) else { return };
+        // A stale cache does not prove the newest unread has actually appeared.
+        let history_is_current = history.iter().map(|message| message.id).max().unwrap_or(0) >= max_id;
+        if self.last_read_attempt.get(&key).is_some_and(|time| time.elapsed() < Duration::from_secs(5)) {
+            ctx.request_repaint_after(Duration::from_secs(5));
+            return;
+        }
+        self.last_read_attempt.insert(key.clone(), Instant::now());
+        if !history_is_current {
+            self.request_history(account, peer_id);
+            return;
+        }
+        self.pending_reads.insert(key, max_id);
+        self.send_cmd(Cmd::MarkRead { account, peer_id, max_id });
+    }
+
+    fn ui_topbar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("topbar")
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("mlxysftele").strong().size(16.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Settings").clicked() {
+                            self.show_settings = true;
+                        }
+                        if ui.button("+ Add account").clicked() {
+                            self.show_add = true;
+                        }
+                        let (label, fill, tip) = if self.alarm_enabled {
+                            ("Alarm: ON", egui::Color32::from_rgb(33, 105, 76), "Turn off the unread alarm for all accounts")
+                        } else {
+                            ("Alarm: OFF", egui::Color32::from_rgb(100, 70, 65), "Turn on the unread alarm for all accounts")
+                        };
+                        if ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong()).fill(fill))
+                            .on_hover_text(tip).clicked() {
+                            self.set_alarm_enabled(!self.alarm_enabled);
+                        }
+                        if self.pending_alarm_request.is_some() {
+                            ui.label(egui::RichText::new("saving…").small().weak());
+                        } else if let Some(error) = &self.alarm_save_error {
+                            ui.colored_label(egui::Color32::from_rgb(255, 176, 46), "Alarm not saved")
+                                .on_hover_text(format!("This choice may reset on restart: {error}"));
+                        }
+                        let total = self.cfg.accounts.len();
+                        let online = self
+                            .cfg
+                            .accounts
+                            .iter()
+                            .filter(|a| self.status.get(&a.name) == Some(&ConnStatus::Online))
+                            .count();
+                        let color = if online > 0 {
+                            egui::Color32::from_rgb(52, 211, 103)
+                        } else {
+                            egui::Color32::from_rgb(255, 176, 46)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{online}/{total} accounts online"))
+                                .color(color)
+                                .strong(),
+                        )
+                        .on_hover_text("all registered accounts stay connected while mlxysftele runs");
+                        if !self.notify_retry.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(255, 176, 46), "Notification sync failed — retrying")
+                                .on_hover_text("Unknown notification settings are not alarmed until they load.");
+                        }
+                        if self.cfg.local_premium.enabled {
+                            ui.label(egui::RichText::new("Local premium").weak().small())
+                                .on_hover_text(
+                                    "client-side conveniences only — server-enforced Telegram Premium is never faked (docs/LOCAL_PREMIUM.md)",
+                                );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_accounts(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(format!("Accounts ({})", self.cfg.accounts.len())).strong().size(13.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if ui.button("+").on_hover_text("Add account").clicked() {
+                    self.show_add = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let mut clicked_name: Option<String> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for account in self.cfg.accounts.clone() {
+                let name = account.name.clone();
+                let selected = self.sel_account.as_deref() == Some(name.as_str());
+                let status = self.status.get(&name).cloned().unwrap_or(ConnStatus::Connecting);
+                let me = self.me.get(&name).cloned();
+                let phone = account.phone.clone();
+                let (unread, alertable) = self.unread.account_counts(&name, &self.notifications, util::now_unix());
+                let refresh_failed = self.dialog_refresh.get(&name).is_some_and(|state| state.failed) || self.notify_retry.contains_key(&name);
+                let text = ui.visuals().text_color();
+                let response = painted_row(ui, selected, 54.0, |p, rect| {
+                    let dot = egui::pos2(rect.left() + 15.0, rect.center().y);
+                    p.circle_filled(dot, 5.0, status_color(&status));
+                    let tx = dot.x + 14.0;
+                    p.text(
+                        egui::pos2(tx, rect.center().y - 9.0),
+                        egui::Align2::LEFT_CENTER,
+                        truncate(&name, if unread > 0 { 12 } else { 16 }),
+                        egui::FontId::proportional(13.5),
+                        text,
+                    );
+                    let caption = me
+                        .as_ref()
+                        .and_then(|m| m.username.as_ref().map(|u| format!("@{u}")))
+                        .or_else(|| phone.clone())
+                        .unwrap_or_else(|| "—".into());
+                    p.text(
+                        egui::pos2(tx, rect.center().y + 9.0),
+                        egui::Align2::LEFT_CENTER,
+                        truncate(&caption, if unread > 0 { 16 } else { 22 }),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(150),
+                    );
+                    let warning = match &status {
+                        ConnStatus::Disabled => Some(("disabled", egui::Color32::from_gray(160))),
+                        ConnStatus::Error(_) => Some(("offline", egui::Color32::from_rgb(255, 95, 86))),
+                        ConnStatus::Unauthorized => Some(("sign in", egui::Color32::from_rgb(255, 175, 85))),
+                        _ if refresh_failed => Some(("sync !", egui::Color32::from_rgb(255, 175, 85))),
+                        _ => None,
+                    };
+                    if let Some((label, color)) = warning {
+                        p.text(egui::pos2(rect.right() - 12.0, rect.center().y - 10.0), egui::Align2::RIGHT_CENTER,
+                            label, egui::FontId::proportional(10.0), color);
+                    }
+                    if unread > 0 {
+                        let digits = if unread > 99 { "99+".to_string() } else { unread.to_string() };
+                        let w = 12.0 + 7.0 * digits.len() as f32;
+                        let pill = egui::Rect::from_center_size(egui::pos2(rect.right() - w / 2.0 - 10.0, rect.center().y + 9.0), egui::vec2(w, 17.0));
+                        let color = if alertable > 0 { egui::Color32::from_rgb(255, 95, 86) } else { egui::Color32::from_gray(105) };
+                        p.rect_filled(pill, 8.5, color);
+                        p.text(pill.center(), egui::Align2::CENTER_CENTER, digits, egui::FontId::proportional(10.5), egui::Color32::WHITE);
+                    }
+                    if warning.is_none() && me.as_ref().map(|m| m.server_premium).unwrap_or(false) {
+                        p.text(
+                            egui::pos2(rect.right() - 12.0, rect.center().y - 10.0),
+                            egui::Align2::RIGHT_CENTER,
+                            "PRO",
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::from_rgb(232, 184, 78),
+                        );
+                    }
+                });
+                let hover = match &me {
+                    Some(m) => format!(
+                        "{}\n{}\nid {}{}",
+                        m.full_name,
+                        name,
+                        m.user_id,
+                        if m.server_premium { " · server premium" } else { "" }
+                    ),
+                    None => name.clone(),
+                };
+                // on_hover_text consumes the response; read the click state first.
+                let clicked = response.clicked();
+                let sync = if !account.enabled { "\nCached unread counts may be out of date" } else if refresh_failed { "\nChat refresh failed; retrying" } else { "" };
+                response.on_hover_text(format!("{hover}\n{}\n{unread} unread ({alertable} unmuted){sync}", status_tooltip(&status)));
+                if clicked {
+                    clicked_name = Some(name);
+                }
+            }
+        });
+        if let Some(name) = clicked_name {
+            self.select_account(name);
+        }
+    }
+
+    fn ui_chats(&mut self, ui: &mut egui::Ui) {
+        let Some(account) = self.sel_account.clone() else {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("No account selected").weak());
+            });
+            return;
+        };
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Chats").strong().size(13.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if ui.button("Refresh").clicked() {
+                    self.request_dialog_refresh(&account);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("Search chats…")
+                    .desired_width(ui.available_width() - 16.0),
+            );
+            ui.add_space(8.0);
+        });
+        ui.add_space(4.0);
+
+        let filter = self.filter.trim().to_lowercase();
+        let dialogs = self.dialogs.get(&account).cloned().unwrap_or_default();
+        let empty = dialogs.is_empty();
+        let mut clicked_peer: Option<PeerId> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for dialog in dialogs {
+                if !filter.is_empty() && !dialog.name.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                let selected = self.sel_peer.get(&account) == Some(&dialog.peer_id);
+                let unread = self.unread.count(&account, dialog.peer_id);
+                let mute = self.notifications.status(&account, dialog.peer_id, util::now_unix());
+                let name = dialog.name.clone();
+                let preview = dialog.preview.clone();
+                let text = ui.visuals().text_color();
+                let response = painted_row(ui, selected, 56.0, |p, rect| {
+                    let center = egui::pos2(rect.left() + 26.0, rect.center().y);
+                    paint_avatar(p, center, 16.0, &name);
+                    let tx = center.x + 26.0;
+                    p.text(
+                        egui::pos2(tx, rect.center().y - 9.0),
+                        egui::Align2::LEFT_CENTER,
+                        truncate(&name, 22),
+                        egui::FontId::proportional(13.0),
+                        text,
+                    );
+                    p.text(
+                        egui::pos2(tx, rect.center().y + 9.0),
+                        egui::Align2::LEFT_CENTER,
+                        preview
+                            .map(|pv| truncate(&pv, 26))
+                            .unwrap_or_else(|| "—".to_string()),
+                        egui::FontId::proportional(10.5),
+                        egui::Color32::from_gray(145),
+                    );
+                    if mute != MuteStatus::Unmuted {
+                        p.text(
+                            egui::pos2(rect.right() - 10.0, rect.center().y - 11.0),
+                            egui::Align2::RIGHT_CENTER,
+                            if mute == MuteStatus::Muted { "muted" } else { "checking…" },
+                            egui::FontId::proportional(10.0), egui::Color32::from_gray(150),
+                        );
+                    }
+                    if unread > 0 {
+                        let digits = format!("{}", unread.min(99));
+                        let w = 12.0 + 7.0 * digits.len() as f32;
+                        let pill = egui::Rect::from_center_size(
+                            egui::pos2(rect.right() - w / 2.0 - 10.0, rect.center().y),
+                            egui::vec2(w, 17.0),
+                        );
+                        let color = if mute == MuteStatus::Unmuted { egui::Color32::from_rgb(255, 95, 86) } else { egui::Color32::from_gray(105) };
+                        p.rect_filled(pill, 8.5, color);
+                        p.text(
+                            pill.center(),
+                            egui::Align2::CENTER_CENTER,
+                            digits,
+                            egui::FontId::proportional(10.5),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                });
+                if response.clicked() {
+                    clicked_peer = Some(dialog.peer_id);
+                }
+            }
+            if empty {
+                ui.add_space(12.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("No dialogs loaded yet.").weak());
+                    ui.label(egui::RichText::new("Press Refresh if the account just came online.").weak().small());
+                });
+            }
+        });
+        if let Some(peer_id) = clicked_peer {
+            self.select_peer(peer_id);
+        }
+    }
+
+    fn ui_chat_view(&mut self, ui: &mut egui::Ui) {
+        let Some(account) = self.sel_account.clone() else {
+            self.ui_welcome(ui);
+            return;
+        };
+        if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(egui::RichText::new("Account disabled").size(18.0).weak());
+                ui.label("Enable this account in Settings to reconnect. Your session is kept.");
+                ui.label("Unread counts are cached and may be out of date while disabled.");
+            });
+            return;
+        }
+        let Some(peer_id) = self.sel_peer.get(&account).copied() else {
+            ui.add_space(80.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Pick a chat on the left").size(18.0).weak());
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Incoming messages appear live in every account — they stay connected.").weak());
+            });
+            return;
+        };
+        let peer_name = self.selected_peer_name(&account, peer_id);
+
+        // Header
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+            let p = ui.painter();
+            paint_avatar(&p, rect.center(), 17.0, &peer_name);
+            ui.add_space(2.0);
+            ui.vertical(|ui| {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(truncate(&peer_name, 48)).strong().size(16.0));
+                ui.label(egui::RichText::new(format!("via {account}")).weak().small());
+            });
+        });
+        ui.add_space(4.0);
+        ui.separator();
+
+        let has_attachment = self.pending_attachment.is_some();
+        let reply = self.reply_draft.as_ref().filter(|r| r.account == account && r.peer_id == peer_id).cloned();
+        let has_reply = reply.is_some();
+        let failed_count = self.failed_sends.get(&(account.clone(), peer_id)).map_or(0, Vec::len);
+        // Composer docked at the bottom; history fills the middle.
+        egui::Panel::bottom("composer_dock")
+            .show_separator_line(false)
+            .exact_size(90.0 + if has_attachment { 38.0 } else { 0.0 } + if has_reply { 38.0 } else { 0.0 } + if failed_count > 0 { 38.0 } else { 0.0 })
+            .show(ui, |ui| {
+                if failed_count > 0 {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(format!("{failed_count} failed draft(s)"));
+                        let can_restore = self.composer.is_empty() && self.pending_attachment.is_none() && self.reply_draft.is_none();
+                        if ui.add_enabled(can_restore, egui::Button::new("Restore oldest")).on_hover_text("Clear the current composer before restoring").clicked() {
+                            self.restore_failed_send(&account, peer_id);
+                        }
+                    });
+                }
+                if let Some(reply) = &reply {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(format!("Replying to #{}: {}", reply.msg_id, truncate(&reply.preview, 55))).small());
+                        if ui.small_button("×").on_hover_text("Cancel reply").clicked() { self.reply_draft = None; }
+                    });
+                }
+                if self.pending_attachment.is_some() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        let name = self
+                            .pending_attachment
+                            .as_ref()
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                            .unwrap_or_else(|| "image".into());
+                        egui::Frame::default()
+                            .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(10, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("Image: {}", truncate(&name, 44))).small());
+                                    if ui.small_button("×").on_hover_text("remove attachment").clicked() {
+                                        self.pending_attachment = None;
+                                    }
+                                });
+                            });
+                    });
+                }
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(10.0);
+                    if ui
+                        .button("Attach…")
+                        .on_hover_text("Send an image — or just drop a file anywhere in the window")
+                        .clicked()
+                    {
+                        self.open_picker();
+                    }
+                    // Consume plain Enter before TextEdit sees it; Shift+Enter
+                    // remains available to insert a newline at the cursor.
+                    let enter = self.edit_draft.is_none() && ui.memory(|m| m.has_focus(composer_id())) && ui.input_mut(|i| {
+                        let mut found = false;
+                        i.events.retain(|event| {
+                            let plain = matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
+                                if modifiers.matches_exact(egui::Modifiers::NONE));
+                            found |= plain;
+                            !plain
+                        });
+                        found
+                    });
+                    let response = ui.add(
+                        egui::TextEdit::multiline(&mut self.composer)
+                            .desired_rows(3)
+                            .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
+                            .id(composer_id())
+                            .hint_text(format!("Message {peer_name}… (Shift+Enter for a new line)"))
+                            .desired_width(ui.available_width() - 178.0),
+                    );
+                    let can_send = !self.composer.trim().is_empty() || self.pending_attachment.is_some();
+                    let send_clicked = ui
+                        .add_enabled(
+                            can_send,
+                            egui::Button::new(egui::RichText::new("Send").color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(46, 122, 214)),
+                        )
+                        .clicked();
+                    if (enter && can_send) || send_clicked {
+                        response.request_focus();
+                        let text = self.composer.trim().to_string();
+                        let reply_to = self.reply_draft.as_ref().filter(|r| r.account == account && r.peer_id == peer_id).map(|r| r.msg_id);
+                        let command = if let Some(path) = self.pending_attachment.clone() {
+                            Some(Cmd::SendPhoto { account: account.clone(), peer_id, path, caption: text, reply_to })
+                        } else if !text.is_empty() {
+                            Some(Cmd::SendText { account: account.clone(), peer_id, text, reply_to })
+                        } else { None };
+                        if let Some(command) = command {
+                            if self.cmd_tx.send(command).is_ok() {
+                                self.pending_attachment = None;
+                                self.composer.clear();
+                                self.reply_draft = None;
+                            } else {
+                                self.toast = Some(("Send failed: worker stopped".into(), Instant::now()));
+                            }
+                        }
+                    }
+                    ui.add_space(6.0);
+                });
+            });
+
+        let messages = self.chats.get(&(account.clone(), peer_id)).cloned().unwrap_or_default();
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                if messages.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        let loading = self.history_pending.contains_key(&(account.clone(), peer_id))
+                            || self.dialogs.get(&account).and_then(|rows| rows.iter().find(|d| d.peer_id == peer_id)).is_some_and(|d| !d.resolved);
+                        let label = if loading { "Loading chat…" } else { "No messages yet — say hi." };
+                        ui.label(egui::RichText::new(label).weak());
+                    });
+                }
+                let text_color = ui.visuals().text_color();
+                let mut last_day: Option<chrono::NaiveDate> = None;
+                for message in &messages {
+                    let day = chrono::DateTime::from_timestamp(message.unix, 0)
+                        .map(|dt| dt.with_timezone(&chrono::Local).date_naive());
+                    if day != last_day {
+                        if let Some(d) = day {
+                            day_chip(ui, &day_label(d));
+                        }
+                        last_day = day;
+                    }
+                    if message.outgoing {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(14.0);
+                            self.ui_bubble(ui, message, true, text_color, &account, peer_id);
+                        });
+                    } else {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add_space(14.0);
+                            self.ui_bubble(ui, message, false, text_color, &account, peer_id);
+                        });
+                    }
+                    ui.add_space(3.0);
+                }
+                ui.add_space(6.0);
+            });
+    }
+
+    /// Render one chat bubble with readable typography and inline images.
+    fn ui_bubble(
+        &mut self,
+        ui: &mut egui::Ui,
+        message: &MsgItem,
+        outgoing: bool,
+        text_color: egui::Color32,
+        account: &str,
+        peer_id: PeerId,
+    ) {
+        let (fill, time_color) = if outgoing {
+            (
+                egui::Color32::from_rgb(47, 84, 132),
+                egui::Color32::from_rgb(170, 196, 224),
+            )
+        } else {
+            (
+                ui.visuals().widgets.noninteractive.bg_fill,
+                egui::Color32::from_gray(140),
+            )
+        };
+        let stroke = if outgoing {
+            egui::Stroke::NONE
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_gray(72))
+        };
+        let reply_label = message.reply.as_ref().map(|reply| {
+            let source = if reply.peer.is_none_or(|peer| peer == peer_id) {
+                self.chats.get(&(account.to_owned(), peer_id)).and_then(|chat| chat.iter().find(|m| m.id == reply.id)).map(preview_text)
+            } else { None };
+            let preview = reply.quote.clone().or(source).unwrap_or_else(|| "Original message unavailable".into());
+            format!("Reply to #{} · {}", reply.id, truncate(&preview, 64))
+        });
+        let mut open_viewer: Option<ViewerState> = None;
+        let mut open_video: Option<(String, PeerId, i32, String)> = None;
+        egui::Frame::default()
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(14.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width(360.0);
+                    if let Some(forwarded) = &message.forwarded {
+                        let label = if forwarded.is_empty() { "Forwarded message".to_owned() } else { format!("Forwarded from {}", truncate(forwarded, 40)) };
+                        ui.label(egui::RichText::new(label).small().color(time_color));
+                    }
+                    if let Some(reply) = &reply_label {
+                        ui.label(egui::RichText::new(reply).small().color(time_color));
+                    }
+                    match &message.media {
+                        Some(MsgMedia::Photo) => {
+                            let key = media_cache_key(account, peer_id, message.id, message.media_token.as_deref());
+                            if let Some(tex) = self.textures.get(&key) {
+                                let size = tex.size_vec2();
+                                let scale = (340.0 / size.x).min(260.0 / size.y).min(1.0);
+                                let response = ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), size * scale))
+                                        .corner_radius(8.0)
+                                        .sense(egui::Sense::click()),
+                                );
+                                let response = response.on_hover_text("click to open full-size viewer");
+                                if response.clicked() {
+                                    open_viewer = Some(ViewerState {
+                                        key: key.clone(),
+                                        zoom: 1.0,
+                                        pan: egui::Vec2::ZERO,
+                                    });
+                                }
+                            } else if self.failed_media.contains(&key) {
+                                ui.label(
+                                    egui::RichText::new("[image unavailable]")
+                                        .italics()
+                                        .weak()
+                                        .small(),
+                                );
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(egui::RichText::new("loading image…").weak().small());
+                                });
+                            }
+                        }
+                        Some(MsgMedia::Video(label)) => {
+                            let key = media_cache_key(account, peer_id, message.id, message.media_token.as_deref());
+                            let busy = self.pending_video_open.as_deref() == Some(key.as_str());
+                            if busy {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(egui::RichText::new("downloading video…").weak().small());
+                                });
+                            } else {
+                                let card = egui::Button::new(
+                                    egui::RichText::new(format!("▶  {label}")).size(13.0),
+                                )
+                                .min_size(egui::vec2(240.0, 64.0));
+                                let resp = ui
+                                    .add(card)
+                                    .on_hover_text("download & play inline");
+                                if resp.clicked() {
+                                    self.pending_video_open = Some(key.clone());
+                                    open_video = Some((account.to_string(), peer_id, message.id, key));
+                                }
+                            }
+                        }
+                        Some(MsgMedia::Label(label)) => {
+                            ui.label(
+                                egui::RichText::new(format!("[{label}]"))
+                                    .italics()
+                                    .color(time_color)
+                                    .size(12.5),
+                            );
+                        }
+                        None => {}
+                    }
+                    if !message.text.is_empty() {
+                        let color = if outgoing { egui::Color32::WHITE } else { text_color };
+                        ui.label(egui::RichText::new(&message.text).color(color).size(13.5));
+                    }
+                    let reaction_pending = self.pending_reactions.contains(&(account.to_owned(), peer_id, message.id));
+                    if !message.reactions.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for reaction in &message.reactions {
+                                let label = match &reaction.kind {
+                                    ReactionKind::Emoji(emoji) => emoji.clone(),
+                                    ReactionKind::Custom(id) => format!("custom {id}"),
+                                    ReactionKind::Paid => "⭐".into(),
+                                };
+                                let mut button = egui::Button::new(format!("{label} {}", reaction.count)).small();
+                                if reaction.chosen { button = button.fill(egui::Color32::from_rgb(50, 105, 155)); }
+                                if ui.add_enabled(!reaction_pending && reaction.kind != ReactionKind::Paid, button).on_hover_text("Toggle reaction").clicked() {
+                                    self.react_to_message(account, peer_id, message, reaction.kind.clone());
+                                }
+                            }
+                        });
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let timestamp = if message.edited { format!("edited {}", format_msg_time(message.unix)) } else { format_msg_time(message.unix) };
+                        ui.label(egui::RichText::new(timestamp).small().color(time_color));
+                        if can_edit_message(message) && ui.add_enabled(self.edit_draft.is_none(), egui::Button::new("Edit").small())
+                            .on_hover_text("Edit this message on Telegram").clicked() {
+                            self.edit_draft = Some(EditDraft { account: account.to_owned(), peer_id, msg_id: message.id,
+                                text: message.text.clone(), original: message.text.clone(), caption: message.media.is_some(),
+                                request_id: None, error: None, changed_remotely: false });
+                            self.ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("edit_message_text")));
+                        }
+                        if ui.small_button("Reply").clicked() {
+                            self.reply_draft = Some(ReplyDraft { account: account.to_owned(), peer_id, msg_id: message.id, preview: preview_text(message) });
+                            self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+                        }
+                        if ui.small_button("Forward").clicked() {
+                            self.forward_draft = Some(ForwardDraft { account: account.to_owned(), source: peer_id, msg_id: message.id, search: String::new(), request_id: None });
+                        }
+                        ui.menu_button("React", |ui| {
+                            ui.label("Choose a reaction");
+                            ui.horizontal_wrapped(|ui| {
+                                for emoji in ["👍", "❤️", "😂", "😮", "😢", "🔥", "👎", "🎉"] {
+                                    if ui.add_enabled(!reaction_pending, egui::Button::new(emoji)).clicked() {
+                                        self.react_to_message(account, peer_id, message, ReactionKind::Emoji(emoji.to_owned()));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.reaction_input).hint_text("Other emoji").desired_width(110.0));
+                                let emoji = self.reaction_input.trim().to_owned();
+                                if ui.add_enabled(!reaction_pending && !emoji.is_empty(), egui::Button::new("Add")).clicked() {
+                                    self.react_to_message(account, peer_id, message, ReactionKind::Emoji(emoji));
+                                    self.reaction_input.clear();
+                                    ui.close();
+                                }
+                            });
+                        });
+                        let pending = self.deleting.contains(&(account.to_owned(), peer_id, message.id));
+                        if ui.add_enabled(!pending, egui::Button::new("Delete…").small())
+                            .on_hover_text("Delete this message for everyone").clicked() {
+                            self.confirm_delete = Some((account.to_owned(), peer_id, message.id));
+                        }
+                    });
+                });
+            });
+        if let Some(viewer) = open_viewer {
+            self.viewer = Some(viewer);
+        }
+        if let Some((account, peer_id, msg_id, cache_key)) = open_video {
+            self.send_cmd(Cmd::OpenVideo { account, peer_id, msg_id, cache_key });
+        }
+    }
+
+    fn queue_edit(&mut self, draft: &mut EditDraft) {
+        if draft.request_id.is_some() || (!draft.caption && draft.text.trim().is_empty()) || draft.text == draft.original { return; }
+        self.next_edit_id = self.next_edit_id.wrapping_add(1);
+        let request_id = self.next_edit_id;
+        let command = Cmd::EditMessage { account: draft.account.clone(), peer_id: draft.peer_id, msg_id: draft.msg_id,
+            text: draft.text.clone(), request_id };
+        if self.cmd_tx.send(command).is_ok() { draft.request_id = Some(request_id); draft.error = None; }
+        else { draft.error = Some("worker stopped".into()); }
+    }
+
+    fn ui_edit_window(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.edit_draft.take() else { return };
+        let mut close = false;
+        egui::Window::new(if draft.caption { "Edit caption" } else { "Edit message" })
+            .collapsible(false).resizable(true).default_width(400.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Account: {}", draft.account));
+                ui.label(egui::RichText::new("Editing sends plain text; existing formatting will be removed. Telegram may reject edits due to permissions or time limits.").weak().small());
+                if draft.changed_remotely { ui.colored_label(egui::Color32::YELLOW, "This message changed on another device. Saving will overwrite that edit."); }
+                ui.add_enabled(draft.request_id.is_none(), egui::TextEdit::multiline(&mut draft.text).id(egui::Id::new("edit_message_text")).desired_rows(5).desired_width(f32::INFINITY));
+                if let Some(error) = &draft.error { ui.colored_label(egui::Color32::LIGHT_RED, format!("Edit failed: {error}")); }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(draft.request_id.is_none(), egui::Button::new("Cancel")).clicked() { close = true; }
+                    let valid = draft.request_id.is_none() && draft.text != draft.original && (draft.caption || !draft.text.trim().is_empty());
+                    if ui.add_enabled(valid, egui::Button::new("Save edit")).clicked() { self.queue_edit(&mut draft); }
+                    if draft.request_id.is_some() { ui.spinner(); ui.label("Saving…"); }
+                });
+            });
+        if !close { self.edit_draft = Some(draft); }
+    }
+
+    fn queue_forward(&mut self, draft: &mut ForwardDraft, destination: PeerId) {
+        if draft.request_id.is_some() { return; }
+        self.next_forward_id = self.next_forward_id.wrapping_add(1);
+        let request_id = self.next_forward_id;
+        if self.cmd_tx.send(Cmd::ForwardMessage { account: draft.account.clone(), source: draft.source,
+            destination, msg_id: draft.msg_id, request_id }).is_ok() {
+            draft.request_id = Some(request_id);
+        } else { self.toast = Some(("Forward failed: worker stopped".into(), Instant::now())); }
+    }
+
+    fn ui_forward_window(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.forward_draft.take() else { return };
+        let mut close = false;
+        egui::Window::new("Forward message")
+            .collapsible(false).resizable(true).default_width(340.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Choose a destination in account {}", draft.account));
+                ui.add(egui::TextEdit::singleline(&mut draft.search).hint_text("Search chats…"));
+                let filter = draft.search.trim().to_lowercase();
+                let dialogs = self.dialogs.get(&draft.account).cloned().unwrap_or_default();
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    let mut found = false;
+                    let saved = self.me.get(&draft.account).and_then(|me| (me.user_id > 0).then(|| PeerId::user(me.user_id)));
+                    if let Some(peer) = saved {
+                        if filter.is_empty() || "saved messages".contains(&filter) {
+                            found = true;
+                            ui.horizontal(|ui| {
+                                ui.label("Saved Messages");
+                                if ui.add_enabled(draft.request_id.is_none(), egui::Button::new("Forward")).clicked() {
+                                    self.queue_forward(&mut draft, peer);
+                                }
+                            });
+                        }
+                    }
+                    for dialog in dialogs.iter().filter(|d| Some(d.peer_id) != saved && (filter.is_empty() || d.name.to_lowercase().contains(&filter))) {
+                        found = true;
+                        ui.horizontal(|ui| {
+                            ui.label(truncate(&dialog.name, 30));
+                            if ui.add_enabled(draft.request_id.is_none() && dialog.resolved, egui::Button::new("Forward"))
+                                .on_hover_text("Forward the original Telegram message to this chat").clicked() {
+                                self.queue_forward(&mut draft, dialog.peer_id);
+                            }
+                        });
+                    }
+                    if !found { ui.label("No matching chats. Refresh the account's chat list and try again."); }
+                });
+                if draft.request_id.is_some() { ui.label("Forwarding…"); }
+                if ui.button("Cancel").clicked() { close = true; }
+            });
+        if !close { self.forward_draft = Some(draft); }
+    }
+
+    fn ui_delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some((account, peer_id, msg_id)) = self.confirm_delete.clone() else { return };
+        egui::Window::new("Delete message?")
+            .collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Delete this message for everyone? This cannot be undone.");
+                ui.label(egui::RichText::new("Telegram may reject this if you don't have permission.").weak().small());
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() { self.confirm_delete = None; }
+                    if ui.button("Delete for everyone").clicked() {
+                        self.confirm_delete = None;
+                        let key = (account.clone(), peer_id, msg_id);
+                        if self.cmd_tx.send(Cmd::DeleteMessage { account: account.clone(), peer_id, msg_id }).is_ok() {
+                            self.deleting.insert(key);
+                        } else {
+                            self.toast = Some(("Could not delete: worker stopped".into(), Instant::now()));
+                        }
+                    }
+                });
+            });
+    }
+
+    /// Write a pasted clipboard image to `<data_dir>/cache/paste/` and stage it.
+    fn stage_pasted_image(&mut self, image: &egui::ColorImage) -> Result<(), String> {
+        let chat_open = self
+            .sel_account
+            .as_ref()
+            .map(|a| self.sel_peer.get(a).is_some())
+            .unwrap_or(false);
+        if !chat_open {
+            return Err("open a chat first".to_string());
+        }
+        let dir = self.data_dir.join("cache").join("paste");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let bytes: Vec<u8> = image
+            .pixels
+            .iter()
+            .flat_map(|c| c.to_srgba_unmultiplied())
+            .collect();
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("pasted_{millis}.png"));
+        image::save_buffer(
+            &path,
+            &bytes,
+            image.width() as u32,
+            image.height() as u32,
+            image::ColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())?;
+        self.pending_attachment = Some(path);
+        Ok(())
+    }
+
+    /// ZapFast-style full-screen image viewer: Esc/× closes, scroll zooms,
+    /// drag pans, double-click toggles fit ↔ 100%.
+    fn ui_viewer(&mut self, ctx: &egui::Context) {
+        let Some(mut viewer) = self.viewer.take() else { return };
+        // Texture gone (never decoded or cache cleared) → drop the viewer.
+        let Some(tex) = self.textures.get(&viewer.key) else { return };
+        let tex_size = tex.size_vec2();
+        let tex_id = tex.id();
+
+        let screen = ctx.input(|i| i.content_rect());
+        let fit = (screen.width() * 0.90 / tex_size.x.max(1.0))
+            .min(screen.height() * 0.86 / tex_size.y.max(1.0))
+            .min(1.0);
+
+        let mut close = false;
+        let mut toggle = false;
+
+        egui::Area::new(egui::Id::new("image_viewer"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.left_top())
+            .show(ctx, |ui| {
+                let response = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(225));
+
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll.abs() > 0.0 && response.hovered() {
+                    viewer.zoom = (viewer.zoom * (1.0 + scroll * 0.0016)).clamp(0.35, 12.0);
+                }
+                if response.dragged() {
+                    viewer.pan += ui.input(|i| i.pointer.delta());
+                }
+                if response.double_clicked() {
+                    toggle = true;
+                }
+
+                let scale = fit * viewer.zoom;
+                let size = tex_size * scale;
+                let center = screen.center() + viewer.pan;
+                let rect = egui::Rect::from_center_size(center, size);
+                ui.painter().image(
+                    tex_id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+
+            });
+
+        // Hint bar pinned to the bottom-center of the screen.
+        egui::Area::new(egui::Id::new("image_viewer_hint"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Esc close · scroll zoom · drag pan · double-click 1:1 / fit")
+                        .small()
+                        .color(egui::Color32::from_gray(190)),
+                );
+            });
+
+        // HUD buttons pinned to the top-right of the screen.
+        egui::Area::new(egui::Id::new("image_viewer_hud"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("−").clicked() {
+                        viewer.zoom = (viewer.zoom / 1.25).clamp(0.35, 12.0);
+                    }
+                    if ui.button("+").clicked() {
+                        viewer.zoom = (viewer.zoom * 1.25).clamp(0.35, 12.0);
+                    }
+                    if ui.button("1:1").on_hover_text("actual pixels").clicked() {
+                        viewer.zoom = 1.0 / fit;
+                        viewer.pan = egui::Vec2::ZERO;
+                    }
+                    if ui.button("Fit").clicked() {
+                        viewer.zoom = 1.0;
+                        viewer.pan = egui::Vec2::ZERO;
+                    }
+                    if ui.button("×").on_hover_text("close (Esc)").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if toggle {
+            viewer.zoom = if (viewer.zoom - 1.0).abs() < 0.01 { 1.0 / fit } else { 1.0 };
+            if viewer.zoom <= 1.0 {
+                viewer.pan = egui::Vec2::ZERO;
+            }
+        }
+        if !close {
+            self.viewer = Some(viewer);
+        }
+    }
+
+    /// Full-screen embedded video player (libmpv): Esc/× closes, the picture
+    /// scales to fit, and the bottom bar carries play/pause, ±10 s skip, a
+    /// seek slider and a volume slider.
+    fn ui_video(&mut self, ctx: &egui::Context) {
+        // Take so we can drop it inside this call if it went bad.
+        let Some(mut player) = self.video.take() else { return };
+        player.refresh_frame(ctx);
+
+        let screen = ctx.input(|i| i.content_rect());
+        let tex_id = player.texture_id();
+        let tex_size = player.size_vec2().unwrap_or(egui::vec2(640.0, 360.0));
+        let title = if player.title.is_empty() {
+            player.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into())
+        } else {
+            player.title.clone()
+        };
+
+        let mut close = false;
+        let mut toggle_pause = false;
+        egui::Area::new(egui::Id::new("video_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.left_top())
+            .show(ctx, |ui| {
+                let response = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(235));
+
+                // Fit the frame, preserving aspect.
+                let fit = (screen.width() * 0.92 / tex_size.x.max(1.0))
+                    .min(screen.height() * 0.78 / tex_size.y.max(1.0))
+                    .min(1.0);
+                let size = tex_size * fit;
+                let video_rect = egui::Rect::from_center_size(
+                    egui::pos2(screen.center().x, screen.min.y + screen.height() * 0.42),
+                    size,
+                );
+                if let Some(tex_id) = tex_id {
+                    ui.painter().image(
+                        tex_id,
+                        video_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    ui.painter().text(
+                        video_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "loading video…",
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::from_gray(200),
+                    );
+                }
+                // Click on the picture/backdrop toggles play/pause.
+                if response.clicked() {
+                    toggle_pause = true;
+                }
+            });
+        if toggle_pause {
+            let paused = player.is_paused();
+            player.set_paused(!paused);
+        }
+
+        // Top bar: title left, close right.
+        egui::Area::new(egui::Id::new("video_topbar"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&title)
+                            .small()
+                            .color(egui::Color32::from_gray(210)),
+                    );
+                    if ui.button("×").on_hover_text("close (Esc)").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        // Bottom control bar.
+        egui::Area::new(egui::Id::new("video_controls"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let paused = player.is_paused();
+                    let eof = player.eof_reached();
+                    if eof {
+                        if ui.button("↻").on_hover_text("replay").clicked() {
+                            player.replay();
+                        }
+                    } else if ui.button(if paused { "▶" } else { "❚❚" }).on_hover_text(if paused { "play" } else { "pause" }).clicked() {
+                        player.set_paused(!paused);
+                    }
+                    if ui.button("−10s").clicked() {
+                        player.skip_relative(-10.0);
+                    }
+                    if ui.button("+10s").clicked() {
+                        player.skip_relative(10.0);
+                    }
+
+                    let pos = player.time_pos().unwrap_or(0.0);
+                    let dur = player.duration().unwrap_or(0.0).max(1.0);
+                    ui.label(egui::RichText::new(format_mmss(pos)).small().monospace());
+                    let mut slider = pos.clamp(0.0, dur);
+                    let resp = ui.add(
+                        egui::Slider::new(&mut slider, 0.0..=dur).show_value(false)
+                    );
+                    if resp.changed() {
+                        player.seek_to(slider);
+                    }
+                    ui.label(egui::RichText::new(format_mmss(dur)).small().monospace());
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("🔊").small());
+                    let mut volume = player.volume().unwrap_or(100.0);
+                    if ui
+                        .add(egui::Slider::new(&mut volume, 0.0..=100.0).show_value(false))
+                        .changed()
+                    {
+                        player.set_volume(volume);
+                    }
+                });
+            });
+
+        if !player.last_error().is_empty() {
+            self.toast = Some((format!("video: {}", player.last_error()), Instant::now()));
+        }
+
+        if !close {
+            self.video = Some(player);
+        }
+        // When closing, the VideoPlayer is dropped here → mpv shuts down.
+    }
+
+    /// Open the in-app image picker for the composer.
+    fn open_picker(&mut self) {
+        self.show_picker = true;
+        self.refresh_picker();
+    }
+
+    fn refresh_picker(&mut self) {
+        self.picker_entries.clear();
+        self.picker_err = None;
+        let read = std::fs::read_dir(&self.picker_dir);
+        match read {
+            Ok(entries) => {
+                let mut items: Vec<(String, PathBuf, bool, u64)> = Vec::new();
+                for e in entries.flatten() {
+                    let path = e.path();
+                    let is_dir = path.is_dir();
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !is_dir && !self.picker_show_all && !is_image_file(&path) {
+                        continue;
+                    }
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    items.push((name, path, is_dir, size));
+                }
+                items.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+                self.picker_entries = items;
+            }
+            Err(e) => self.picker_err = Some(format!("{}: {e}", self.picker_dir.display())),
+        }
+    }
+
+    fn ui_picker_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_picker;
+        egui::Window::new("Send image")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(540.0)
+            .default_height(440.0)
+            .show(ctx, |ui| {
+                let can_attach = self
+                    .sel_account
+                    .as_ref()
+                    .map(|a| self.sel_peer.get(a).is_some())
+                    .unwrap_or(false);
+                ui.label(egui::RichText::new(self.picker_dir.display().to_string()).weak().small());
+                ui.horizontal(|ui| {
+                    if ui.button("..").on_hover_text("parent directory").clicked() {
+                        if let Some(parent) = self.picker_dir.parent().map(|p| p.to_path_buf()) {
+                            self.picker_dir = parent;
+                            self.refresh_picker();
+                        }
+                    }
+                    if ui.button("~").on_hover_text("home directory").clicked() {
+                        if let Some(home) = std::env::var_os("HOME") {
+                            self.picker_dir = PathBuf::from(home);
+                            self.refresh_picker();
+                        }
+                    }
+                    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                        for label in ["Pictures", "Downloads", "Desktop"] {
+                            let candidate = home.join(label);
+                            if candidate.is_dir() && ui.button(label).clicked() {
+                                self.picker_dir = candidate;
+                                self.refresh_picker();
+                            }
+                        }
+                    }
+                    let mut show_all = self.picker_show_all;
+                    if ui.checkbox(&mut show_all, "show all files").changed() {
+                        self.picker_show_all = show_all;
+                        self.refresh_picker();
+                    }
+                });
+                if let Some(err) = &self.picker_err {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 110), err.as_str());
+                }
+                ui.separator();
+                if !can_attach {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 176, 46),
+                        "open a chat first, then pick an image",
+                    );
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let entries = self.picker_entries.clone();
+                    if entries.is_empty() {
+                        ui.add_space(12.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new("no images here").weak());
+                            ui.label(egui::RichText::new("tick 'show all files' or navigate elsewhere").weak().small());
+                        });
+                    }
+                    for (name, path, is_dir, size) in entries {
+                        if is_dir {
+                            if ui.selectable_label(false, format!("{name}/")).clicked() {
+                                self.picker_dir = path;
+                                self.refresh_picker();
+                            }
+                        } else {
+                            let label = format!("{name}  ·  {}", util::human_bytes(size));
+                            if ui.selectable_label(false, label).clicked() {
+                                if can_attach {
+                                    self.pending_attachment = Some(path);
+                                    self.show_picker = false;
+                                } else {
+                                    self.toast = Some(("open a chat first".into(), Instant::now()));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        self.show_picker = open;
+    }
+
+    fn ui_welcome(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(70.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new("mlxysftele").strong().size(30.0));
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("ZapFast-style, ultra low-RAM Telegram for every account you own").weak());
+            ui.add_space(28.0);
+            ui.label("• Native Rust + egui — no browser, no Electron, no webview");
+            ui.label("• Unlimited accounts, all of them connected at the same time");
+            ui.label("• Streaming media, honest local-only premium conveniences");
+            ui.add_space(28.0);
+            if ui.button(egui::RichText::new("Add your first account").size(16.0)).clicked() {
+                self.show_add = true;
+            }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("You will need api_id/api_hash from https://my.telegram.org/apps (Settings).").weak().small());
+        });
+    }
+}
+
+// ---------------- shared paint helpers ----------------
+
+fn painted_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    height: f32,
+    contents: impl FnOnce(&egui::Painter, egui::Rect),
+) -> egui::Response {
+    let width = ui.available_width().max(0.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let fill = if selected {
+        Some(ui.visuals().selection.bg_fill)
+    } else if response.hovered() {
+        Some(ui.visuals().widgets.hovered.weak_bg_fill)
+    } else {
+        None
+    };
+    if let Some(fill) = fill {
+        painter.rect_filled(rect.shrink2(egui::vec2(4.0, 2.0)), 8.0, fill);
+    }
+    contents(&painter, rect);
+    response
+}
+
+fn paint_avatar(painter: &egui::Painter, center: egui::Pos2, radius: f32, name: &str) {
+    painter.circle_filled(center, radius, avatar_fill(name));
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        initials(name),
+        egui::FontId::proportional(radius),
+        egui::Color32::WHITE,
+    );
+}
+
+fn day_label(d: chrono::NaiveDate) -> String {
+    let today = chrono::Local::now().date_naive();
+    if d == today {
+        return "Today".into();
+    }
+    if let Some(yesterday) = today.pred_opt() {
+        if d == yesterday {
+            return "Yesterday".into();
+        }
+    }
+    d.format("%d %B %Y").to_string()
+}
+
+fn day_chip(ui: &mut egui::Ui, label: &str) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let approx = 36.0 + label.chars().count() as f32 * 6.2;
+        ui.add_space(((ui.available_width() - approx) / 2.0).max(0.0));
+        egui::Frame::default()
+            .fill(egui::Color32::from_gray(50))
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::symmetric(12, 3))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(label).small().color(egui::Color32::from_gray(208)));
+            });
+    });
+    ui.add_space(2.0);
+}
+
+
+// ---------------- windows & toast ----------------
+
+impl TelegramApp {
+    fn ui_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.heading("Telegram API credentials");
+                ui.label(
+                    egui::RichText::new("Create your own at https://my.telegram.org/apps — one pair works for all accounts.")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(4.0);
+                egui::Grid::new("creds_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("api_id");
+                    ui.text_edit_singleline(&mut self.api_id_draft);
+                    ui.end_row();
+                    ui.label("api_hash");
+                    ui.add(egui::TextEdit::singleline(&mut self.api_hash_draft).password(true));
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Save credentials").clicked() {
+                        match self.api_id_draft.trim().parse::<i32>() {
+                            Ok(api_id) => {
+                                let api_hash = self.api_hash_draft.trim().to_string();
+                                if api_hash.is_empty() {
+                                    self.toast = Some(("api_hash must not be empty".into(), Instant::now()));
+                                } else {
+                                    self.send_cmd(Cmd::SaveCreds { api_id, api_hash });
+                                }
+                            }
+                            Err(_) => {
+                                self.toast = Some(("api_id must be an integer".into(), Instant::now()));
+                            }
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("stored in {}", Config::path(&self.data_dir).display()))
+                            .weak()
+                            .small(),
+                    );
+                });
+
+                ui.separator();
+                ui.heading("Local premium (client-side only)");
+                ui.label(
+                    egui::RichText::new(
+                        "These toggles only unlock conveniences inside this client. Server-enforced Telegram Premium (upload limits, faster DCs, reactions…) is never faked — see docs/LOCAL_PREMIUM.md.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                let mut master = self.cfg.local_premium.enabled;
+                if ui.checkbox(&mut master, "Enable local premium").changed() {
+                    self.cfg.local_premium.set_all(master);
+                    self.send_cmd(Cmd::SetLocalPremium { flag: None, on: master });
+                }
+                ui.add_enabled_ui(self.cfg.local_premium.enabled, |ui| {
+                    for doc in premium::TOGGLE_DOCS {
+                        let mut value = premium_flag(&self.cfg.local_premium, doc.key);
+                        if ui
+                            .checkbox(&mut value, doc.label)
+                            .on_hover_text(doc.detail)
+                            .changed()
+                        {
+                            premium_set_local(&mut self.cfg.local_premium, doc.key, value);
+                            self.send_cmd(Cmd::SetLocalPremium { flag: Some(doc.key.to_string()), on: value });
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.heading("Accounts");
+                if self.cfg.accounts.is_empty() {
+                    ui.label(egui::RichText::new("no accounts registered yet").weak());
+                }
+                ui.label(egui::RichText::new("Account alarm switches are local and obey the global alarm switch and Telegram chat mutes. Disabled accounts keep their sessions but do not sync or sound alarms.").weak().small());
+                for account in self.cfg.accounts.clone() {
+                    let name = account.name.clone();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(truncate(&name, 20)).strong());
+                        let mut connected = account.enabled;
+                        let busy = self.pending_account_settings.contains_key(&(name.clone(), true));
+                        if ui.add_enabled(!busy, egui::Checkbox::new(&mut connected, "Account enabled"))
+                            .on_hover_text("Disable to disconnect without signing out; enable to reconnect").changed() {
+                            self.set_account_setting(&name, true, connected);
+                        }
+                        let mut alarm = account.alarm_enabled;
+                        let alarm_busy = self.pending_account_settings.contains_key(&(name.clone(), false));
+                        if ui.add_enabled(!alarm_busy, egui::Checkbox::new(&mut alarm, "Alarm"))
+                            .on_hover_text("Allow this account's unmuted unread messages to sound the global alarm").changed() {
+                            self.set_account_setting(&name, false, alarm);
+                        }
+                        if busy || alarm_busy { ui.label("Applying…"); }
+                    });
+                    for connection in [true, false] {
+                        if let Some(error) = self.account_setting_errors.get(&(name.clone(), connection)) {
+                            ui.colored_label(egui::Color32::YELLOW, format!("{} setting not saved: {error}", if connection { "Account" } else { "Alarm" }));
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        let name = account.name.clone();
+                        let caption = account
+                            .username
+                            .as_ref()
+                            .map(|u| format!("@{u}"))
+                            .or_else(|| account.phone.clone())
+                            .unwrap_or_default();
+                        ui.label(egui::RichText::new(caption).weak().small());
+
+                        let confirm_logout = self.confirm_logout.as_deref() == Some(name.as_str());
+                        if ui
+                            .add_enabled(account.enabled && !self.pending_account_settings.contains_key(&(name.clone(), true)), egui::Button::new(if confirm_logout { "Confirm sign out?" } else { "Sign out" }))
+                            .on_hover_text("Enable the account before signing out on Telegram")
+                            .clicked()
+                        {
+                            if confirm_logout {
+                                self.send_cmd(Cmd::Logout { name: name.clone() });
+                                self.confirm_logout = None;
+                            } else {
+                                self.confirm_logout = Some(name.clone());
+                            }
+                        }
+
+                        let confirm_remove = self.confirm_remove.as_deref() == Some(name.as_str());
+                        if ui
+                            .button(if confirm_remove { "Confirm remove?" } else { "Remove" })
+                            .clicked()
+                        {
+                            if confirm_remove {
+                                self.send_cmd(Cmd::RemoveLocal { name: name.clone() });
+                                self.confirm_remove = None;
+                            } else {
+                                self.confirm_remove = Some(name.clone());
+                            }
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("data dir: {}", self.data_dir.display())).weak().small(),
+                );
+                ui.label(egui::RichText::new("sessions stay on disk, never in config.json; they are owner-only files").weak().small());
+            });
+        self.show_settings = open;
+    }
+
+    fn ui_add_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_add;
+        egui::Window::new("Add account")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                let step = self.add.step.unwrap_or(AddStep::Form);
+                match step {
+                    AddStep::Form => {
+                        ui.label("Register another Telegram account. Add as many as you like — they all stay connected.");
+                        ui.add_space(6.0);
+                        egui::Grid::new("add_grid").num_columns(2).show(ui, |ui| {
+                            ui.label("handle");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add.name)
+                                    .hint_text("work"),
+                            );
+                            ui.end_row();
+                            ui.label("phone");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add.phone)
+                                    .hint_text("+6591234567"),
+                            );
+                            ui.end_row();
+                        });
+                        ui.label(
+                            egui::RichText::new("handle: a-z 0-9 _ - . (max 64 chars); phone with country code")
+                                .weak()
+                                .small(),
+                        );
+                        if let Some(err) = &self.add.error {
+                            ui.colored_label(egui::Color32::from_rgb(255, 120, 110), err.as_str());
+                        }
+                        ui.horizontal(|ui| {
+                            if self.add.busy {
+                                ui.spinner();
+                                ui.label("requesting code…");
+                            } else if ui.button("Send code").clicked() {
+                                self.submit_add_form();
+                            }
+                        });
+                    }
+                    AddStep::Code => {
+                        ui.label(format!("A login code was sent to {}.", self.add.phone.trim()));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("code");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add.code)
+                                    .hint_text("12345")
+                                    .desired_width(120.0),
+                            );
+                        });
+                        if let Some(err) = &self.add.error {
+                            ui.colored_label(egui::Color32::from_rgb(255, 120, 110), err.as_str());
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Back").clicked() {
+                                self.add.step = Some(AddStep::Form);
+                                self.add.error = None;
+                            }
+                            if self.add.busy {
+                                ui.spinner();
+                            } else if ui.button("Sign in").clicked() {
+                                let name = self.add.name.trim().to_string();
+                                let code = self.add.code.trim().to_string();
+                                if code.is_empty() {
+                                    self.add.error = Some("enter the code you received".into());
+                                } else {
+                                    self.add.busy = true;
+                                    self.add.error = None;
+                                    self.send_cmd(Cmd::SubmitCode { name, code });
+                                }
+                            }
+                        });
+                    }
+                    AddStep::Password => {
+                        ui.label("This account has two-factor authentication enabled.");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("password");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add.password)
+                                    .password(true)
+                                    .desired_width(220.0),
+                            );
+                        });
+                        if let Some(err) = &self.add.error {
+                            ui.colored_label(egui::Color32::from_rgb(255, 120, 110), err.as_str());
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Back").clicked() {
+                                self.add.step = Some(AddStep::Code);
+                                self.add.error = None;
+                            }
+                            if self.add.busy {
+                                ui.spinner();
+                            } else if ui.button("Verify").clicked() {
+                                let name = self.add.name.trim().to_string();
+                                let password = self.add.password.clone();
+                                if password.is_empty() {
+                                    self.add.error = Some("enter your 2FA password".into());
+                                } else {
+                                    self.add.busy = true;
+                                    self.add.error = None;
+                                    self.send_cmd(Cmd::SubmitPassword { name, password });
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        self.show_add = open;
+    }
+
+    fn submit_add_form(&mut self) {
+        let name = self.add.name.trim().to_string();
+        let phone = self.add.phone.trim().to_string();
+        if !util::valid_account_name(&name) {
+            self.add.error = Some("invalid handle (allowed: a-z A-Z 0-9 _ - ., max 64 chars)".into());
+            return;
+        }
+        if self.cfg.accounts.iter().any(|a| a.name == name) {
+            self.add.error = Some(format!("account '{name}' already exists"));
+            return;
+        }
+        if phone.is_empty() {
+            self.add.error = Some("phone number is required (with country code)".into());
+            return;
+        }
+        self.add.busy = true;
+        self.add.error = None;
+        self.send_cmd(Cmd::BeginLogin { name, phone });
+    }
+
+    fn ui_toast(&mut self, ctx: &egui::Context) {
+        if let Some((msg, _)) = &self.toast {
+            egui::Area::new(egui::Id::new("toast"))
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -64.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(38, 42, 50))
+                        .inner_margin(egui::Margin::symmetric(14, 9))
+                        .corner_radius(8.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(msg.as_str()).color(egui::Color32::WHITE));
+                        });
+                });
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod message_cache_tests {
+    use super::*;
+
+    fn account(name: &str) -> AccountMeta {
+        AccountMeta { name: name.into(), phone: None, user_id: None, username: None,
+            created_unix: 0, last_login_unix: None, enabled: true, alarm_enabled: true }
+    }
+
+    fn photo(id: i32, text: &str) -> MsgItem {
+        MsgItem { id, outgoing: true, edited: false, unix: 1, text: text.into(), media: Some(MsgMedia::Photo), media_token: None, reply: None, forwarded: None, reactions: vec![] }
+    }
+
+    fn dialog(peer_id: PeerId, name: &str, top: i32, pinned: bool) -> DialogItem {
+        DialogItem { peer_id, name: name.into(), preview: Some("old".into()), unread_count: 0,
+            top_message: top, read_inbox_max_id: 0, category: Category::User,
+            mute_until: Some(0), pinned, resolved: true }
+    }
+
+    #[test]
+    fn background_messages_update_chat_rows_badges_and_survive_stale_snapshots() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test();
+        let peer = PeerId::user(1);
+        let pinned = PeerId::user(2);
+        let other = PeerId::user(3);
+        app.sel_account = Some("a".into());
+        app.sel_peer.insert("b".into(), peer);
+        app.dialogs.insert("b".into(), vec![dialog(pinned, "pinned", 1, true), dialog(other, "other", 2, false), dialog(peer, "friend", 10, false)]);
+        app.notifications.set_peer("b", peer, Some(0), Instant::now());
+        let before = Instant::now();
+        let mut incoming = photo(11, "latest message"); incoming.outgoing = false;
+        app.apply_event(Evt::Incoming { account: "b".into(), peer_id: peer, msg: incoming, peer_name: Some("friend".into()), peer_ref: None });
+        assert_eq!(app.dialogs["b"][1].peer_id, peer);
+        assert_eq!(app.dialogs["b"][1].preview.as_deref(), Some("latest message"));
+        assert_eq!(app.unread.account_counts("b", &app.notifications, 1), (1, 1));
+        assert_eq!(app.unread.account_counts("a", &app.notifications, 1), (0, 0));
+        app.apply_event(Evt::Dialogs { name: "b".into(), observed: before, items: vec![dialog(pinned, "pinned", 1, true), dialog(peer, "friend", 10, false)] });
+        assert_eq!(app.dialogs["b"][1].preview.as_deref(), Some("latest message"));
+        assert_eq!(app.unread.count("b", peer), 1);
+        app.select_account("b".into());
+        assert!(!app.sel_peer.contains_key("b"));
+        assert_eq!(app.unread.count("b", peer), 1);
+        assert!(app.dialog_refresh["b"].dirty);
+    }
+
+    #[test]
+    fn unknown_dialog_stays_visible_during_stale_refresh_and_resolves() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.sel_account = Some("a".into());
+        let peer = PeerId::user(9);
+        let before = Instant::now();
+        let mut msg = photo(20, "new chat"); msg.outgoing = false;
+        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: peer, msg, peer_name: Some("Alice".into()), peer_ref: None });
+        assert_eq!(app.dialogs["a"][0].name, "Alice");
+        assert!(!app.dialogs["a"][0].resolved);
+        app.apply_event(Evt::Dialogs { name: "a".into(), observed: before, items: vec![] });
+        assert_eq!(app.dialogs["a"][0].peer_id, peer);
+        app.select_peer(peer);
+        assert!(cmd_rx.try_recv().is_err()); // Wait for peer resolution before history.
+        let observed = Instant::now() + Duration::from_secs(1);
+        app.apply_event(Evt::Dialogs { name: "a".into(), observed, items: vec![dialog(peer, "Alice", 20, false)] });
+        assert!(app.dialogs["a"][0].resolved);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { peer_id, .. }) if peer_id == peer));
+    }
+
+    #[test]
+    fn live_peer_reference_allows_opening_a_new_chat_before_dialog_refresh() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.sel_account = Some("a".into());
+        let peer = PeerId::user(9);
+        let reference = PeerRef { id: peer, auth: Default::default() };
+        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: peer, msg: photo(2, "new"), peer_name: None, peer_ref: Some(reference) });
+        assert!(app.dialogs["a"][0].resolved);
+        app.select_peer(peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::StashPeer { peer, .. }) if peer.id == reference.id));
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { peer_id, .. }) if peer_id == peer));
+    }
+
+    #[test]
+    fn refreshes_coalesce_without_dropping_events_and_retry_failures() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let now = Instant::now();
+        app.request_dialog_refresh("a");
+        app.pump_dialog_refreshes(now);
+        let first = match cmd_rx.try_recv().unwrap() { Cmd::RefreshDialogs { account, request_id } => { assert_eq!(account, "a"); request_id }, _ => panic!("wrong command") };
+        app.request_dialog_refresh("a"); app.request_dialog_refresh("a");
+        app.pump_dialog_refreshes(now + REFRESH_COOLDOWN);
+        assert!(cmd_rx.try_recv().is_err());
+        app.apply_event(Evt::DialogsComplete { account: "a".into(), request_id: None, successful: true });
+        assert_eq!(app.dialog_refresh["a"].pending, Some(first));
+        app.apply_event(Evt::DialogsComplete { account: "a".into(), request_id: Some(first), successful: true });
+        app.pump_dialog_refreshes(now + REFRESH_COOLDOWN);
+        let second = match cmd_rx.try_recv().unwrap() { Cmd::RefreshDialogs { request_id, .. } => request_id, _ => panic!("wrong command") };
+        assert_ne!(first, second);
+        app.apply_event(Evt::DialogsComplete { account: "a".into(), request_id: Some(second), successful: false });
+        assert!(app.dialog_refresh["a"].failed);
+        let retry = app.dialog_refresh["a"].retry_at.unwrap();
+        app.pump_dialog_refreshes(retry - Duration::from_millis(1));
+        assert!(cmd_rx.try_recv().is_err());
+        app.pump_dialog_refreshes(retry.max(now + REFRESH_COOLDOWN * 2));
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::RefreshDialogs { .. })));
+    }
+
+    #[test]
+    fn explicit_reopen_reloads_history_before_marking_unread_as_read() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        let peer = PeerId::user(1);
+        app.sel_account = Some("a".into());
+        app.chats.insert(("a".into(), peer), vec![photo(10, "cached")]);
+        app.unread.incoming("a", peer, 10);
+        app.select_peer(peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        ctx.run_ui(egui::RawInput { focused: true, ..Default::default() }, |ui| app.mark_visible_chat_read(ui.ctx())).drop_without_applying_deltas();
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(app.unread.count("a", peer), 1);
+    }
+
+    fn edit_draft(account: &str, peer_id: PeerId, msg_id: i32, caption: bool) -> EditDraft {
+        EditDraft { account: account.into(), peer_id, msg_id, text: "changed".into(), original: "original".into(),
+            caption, request_id: None, error: None, changed_remotely: false }
+    }
+
+    #[test]
+    fn edit_targets_own_non_forwarded_messages_and_photo_captions() {
+        let mut msg = photo(5, "caption");
+        assert!(can_edit_message(&msg));
+        msg.text.clear(); assert!(can_edit_message(&msg));
+        msg.outgoing = false; assert!(!can_edit_message(&msg));
+        msg.outgoing = true; msg.forwarded = Some(String::new()); assert!(!can_edit_message(&msg));
+        msg.forwarded = None; msg.media = None; assert!(can_edit_message(&msg));
+        msg.media = Some(MsgMedia::Label("sticker".into())); assert!(!can_edit_message(&msg));
+    }
+
+    #[test]
+    fn edits_are_scoped_and_failure_preserves_draft_success_reloads_history() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::channel(1);
+        let mut draft = edit_draft("a", peer, 9, true);
+        app.queue_edit(&mut draft);
+        app.queue_edit(&mut draft);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::EditMessage { account, peer_id, msg_id: 9, text, request_id: 1 })
+            if account == "a" && peer_id == peer && text == "changed"));
+        assert!(cmd_rx.try_recv().is_err());
+        app.edit_draft = Some(draft);
+        app.apply_event(Evt::EditResult { account: "a".into(), peer_id: peer, msg_id: 9, request_id: 1, result: Err("not allowed".into()) });
+        assert_eq!(app.edit_draft.as_ref().unwrap().text, "changed");
+        assert_eq!(app.edit_draft.as_ref().unwrap().error.as_deref(), Some("not allowed"));
+        let mut draft = app.edit_draft.take().unwrap();
+        draft.text.clear(); // captions can be removed
+        app.queue_edit(&mut draft);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::EditMessage { text, request_id: 2, .. }) if text.is_empty()));
+        app.edit_draft = Some(draft);
+        app.request_history("a".into(), peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        app.apply_event(Evt::EditResult { account: "a".into(), peer_id: peer, msg_id: 9, request_id: 2, result: Ok(()) });
+        assert!(app.edit_draft.is_none());
+        assert!(app.history_reload_after.contains(&(String::from("a"), peer)));
+        app.apply_event(Evt::History { account: "a".into(), peer_id: peer, messages: vec![photo(9, "stale")] });
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+    }
+
+    #[test]
+    fn edits_refuse_empty_text_warn_about_remote_changes_and_handle_deletions() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::channel(1); let other = PeerId::channel(2);
+        let mut draft = edit_draft("a", peer, 9, false);
+        draft.text = "  ".into(); app.queue_edit(&mut draft); assert!(cmd_rx.try_recv().is_err());
+        app.edit_draft = Some(draft);
+        app.apply_event(Evt::Edited { account: "a".into(), peer_id: other, msg: photo(9, "different chat") });
+        assert!(!app.edit_draft.as_ref().unwrap().changed_remotely);
+        app.apply_event(Evt::Edited { account: "a".into(), peer_id: peer, msg: photo(9, "remote") });
+        assert!(app.edit_draft.as_ref().unwrap().changed_remotely);
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: Some(other), ids: vec![9] });
+        assert!(app.edit_draft.is_some());
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: Some(peer), ids: vec![9] });
+        assert!(app.edit_draft.is_none());
+    }
+
+    #[test]
+    fn late_edit_response_cannot_close_a_different_editor() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.edit_draft = Some(edit_draft("a", peer, 10, false));
+        app.apply_event(Evt::EditResult { account: "a".into(), peer_id: peer, msg_id: 9, request_id: 1, result: Ok(()) });
+        assert_eq!(app.edit_draft.as_ref().unwrap().msg_id, 10);
+    }
+
+    #[test]
+    fn forward_requests_are_bound_to_source_and_destination_account() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let source = PeerId::user(1); let destination = PeerId::channel(2);
+        let mut draft = ForwardDraft { account: "account-a".into(), source, msg_id: 77, search: String::new(), request_id: None };
+        app.queue_forward(&mut draft, destination);
+        app.queue_forward(&mut draft, destination);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::ForwardMessage { account, source: from, destination: to, msg_id: 77, request_id: 1 })
+            if account == "account-a" && from == source && to == destination));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn forward_update_variants_extract_ids_without_panicking() {
+        let message_id = || tl::types::UpdateMessageId { id: 123, random_id: 456 }.into();
+        let updates: tl::enums::Updates = tl::types::Updates { updates: vec![message_id()], users: vec![], chats: vec![], date: 0, seq: 0 }.into();
+        let combined: tl::enums::Updates = tl::types::UpdatesCombined { updates: vec![message_id()], users: vec![], chats: vec![], date: 0, seq_start: 0, seq: 0 }.into();
+        let short: tl::enums::Updates = tl::types::UpdateShort { update: message_id(), date: 0 }.into();
+        assert_eq!(forwarded_message_id(&updates, 456), Some(123));
+        assert_eq!(forwarded_message_id(&combined, 456), Some(123));
+        assert_eq!(forwarded_message_id(&short, 456), Some(123));
+        assert_eq!(forwarded_message_id(&updates, 99), None);
+        assert_eq!(forwarded_message_id(&tl::enums::Updates::TooLong, 456), None);
+        assert_ne!(forward_random_id(), forward_random_id());
+    }
+
+    #[test]
+    fn photo_reply_uses_original_chat_message_id() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        let peer = PeerId::user(1);
+        app.sel_account = Some("a".into()); app.sel_peer.insert("a".into(), peer);
+        app.reply_draft = Some(ReplyDraft { account: "a".into(), peer_id: peer, msg_id: 44, preview: "photo".into() });
+        app.pending_attachment = Some(PathBuf::from("image.png"));
+        app.composer = "caption".into();
+        ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+        ctx.run_ui(egui::RawInput { focused: true, ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        ctx.run_ui(egui::RawInput { focused: true, events: vec![enter], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SendPhoto { account, peer_id, path, caption, reply_to: Some(44) })
+            if account == "a" && peer_id == peer && path == PathBuf::from("image.png") && caption == "caption"));
+        assert!(app.reply_draft.is_none());
+    }
+
+    #[test]
+    fn failed_reply_photo_can_be_restored_without_overwriting_another_draft() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let path = PathBuf::from("image.png");
+        app.chats.insert(("a".into(), peer), vec![photo(9, "original")]);
+        app.apply_event(Evt::Sent { account: "a".into(), peer_id: peer, source_path: None,
+            result: Err("offline".into()), draft: SendDraft { text: "caption".into(), attachment: Some(path.clone()), reply_to: Some(9) } });
+        app.composer = "other draft".into();
+        app.restore_failed_send("a", peer);
+        assert_eq!(app.composer, "other draft");
+        app.composer.clear();
+        app.restore_failed_send("a", peer);
+        assert_eq!(app.composer, "caption");
+        assert_eq!(app.pending_attachment.as_ref(), Some(&path));
+        assert_eq!(app.reply_draft.as_ref().unwrap().msg_id, 9);
+        assert!(!app.failed_sends.contains_key(&(String::from("a"), peer)));
+    }
+
+    #[test]
+    fn reaction_race_during_history_fetch_schedules_a_follow_up() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let key = (String::from("a"), peer);
+        app.request_history("a".into(), peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        let observed = Instant::now() - Duration::from_secs(1);
+        app.apply_event(Evt::Reactions { account: "a".into(), peer_id: peer, msg_id: 7, minimal: false,
+            reactions: vec![ReactionItem { kind: ReactionKind::Emoji("👍".into()), count: 1, chosen: false }] });
+        app.apply_event(Evt::ReactionResult { account: "a".into(), peer_id: peer, msg_id: 7, observed, result: Ok(Some((vec![], false))) });
+        assert!(app.history_reload_after.contains(&key));
+        app.apply_event(Evt::History { account: "a".into(), peer_id: peer, messages: vec![photo(7, "hello")] });
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        assert!(app.history_pending.contains_key(&key));
+    }
+
+    #[test]
+    fn reactions_toggle_without_losing_other_choices_and_reconcile_live_updates() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let mut msg = photo(7, "hello");
+        let thumbs = ReactionKind::Emoji("👍".into());
+        let heart = ReactionKind::Emoji("❤️".into());
+        msg.reactions = vec![ReactionItem { kind: thumbs.clone(), count: 2, chosen: true }, ReactionItem { kind: heart.clone(), count: 1, chosen: true }];
+        app.chats.insert(("a".into(), peer), vec![msg.clone()]);
+        app.react_to_message("a", peer, &msg, thumbs.clone());
+        app.react_to_message("a", peer, &msg, thumbs.clone()); // no duplicate request while pending
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::React { reactions, .. }) if reactions == vec![heart.clone()]));
+        assert!(cmd_rx.try_recv().is_err());
+        let observed = Instant::now() - Duration::from_secs(1);
+        app.apply_event(Evt::Reactions { account: "a".into(), peer_id: peer, msg_id: 7,
+            reactions: vec![ReactionItem { kind: heart.clone(), count: 3, chosen: false }], minimal: true });
+        assert!(app.chats[&(String::from("a"), peer)][0].reactions[0].chosen);
+        app.apply_event(Evt::ReactionResult { account: "a".into(), peer_id: peer, msg_id: 7, observed,
+            result: Ok(Some((vec![ReactionItem { kind: thumbs, count: 1, chosen: false }], false))) });
+        assert_eq!(app.chats[&(String::from("a"), peer)][0].reactions[0].kind, heart);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { peer_id, .. }) if peer_id == peer));
+        assert!(!app.pending_reactions.contains(&(String::from("a"), peer, 7)));
+    }
+
+    #[test]
+    fn reaction_updates_replay_over_stale_history_without_cross_chat_leaks() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::channel(1); let other = PeerId::channel(2);
+        app.chats.insert(("a".into(), other), vec![photo(9, "other")]);
+        app.request_history("a".into(), peer);
+        let reactions = vec![ReactionItem { kind: ReactionKind::Emoji("👍".into()), count: 3, chosen: true }];
+        app.apply_event(Evt::Reactions { account: "a".into(), peer_id: peer, msg_id: 9, reactions: reactions.clone(), minimal: false });
+        app.apply_event(Evt::History { account: "a".into(), peer_id: peer, messages: vec![photo(9, "stale")] });
+        assert_eq!(app.chats[&(String::from("a"), peer)][0].reactions, reactions);
+        assert!(app.chats[&(String::from("a"), other)][0].reactions.is_empty());
+    }
+
+    #[test]
+    fn reaction_tl_roundtrip_preserves_counts_choices_and_custom_kind() {
+        let raw = tl::types::MessageReactions { min: false, can_see_list: false, reactions_as_tags: false,
+            results: vec![tl::types::ReactionCount { chosen_order: Some(0),
+                reaction: tl::types::ReactionEmoji { emoticon: "👍".into() }.into(), count: 4 }.into(),
+                tl::types::ReactionCount { chosen_order: None,
+                    reaction: tl::types::ReactionCustomEmoji { document_id: 123 }.into(), count: 2 }.into()],
+            recent_reactions: None, top_reactors: None };
+        let (reactions, minimal) = parse_reactions(&raw.into());
+        assert!(!minimal);
+        assert_eq!(reactions[0], ReactionItem { kind: ReactionKind::Emoji("👍".into()), count: 4, chosen: true });
+        assert_eq!(reactions[1].kind, ReactionKind::Custom(123));
+        assert!(reaction_to_tl(&ReactionKind::Paid).is_none());
+    }
+
+    #[test]
+    fn reply_target_is_chat_scoped_and_cleared_if_deleted_or_switching() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.sel_account = Some("a".into()); app.sel_peer.insert("a".into(), peer);
+        app.reply_draft = Some(ReplyDraft { account: "a".into(), peer_id: peer, msg_id: 5, preview: "hi".into() });
+        app.apply_event(Evt::Deleted { account: "b".into(), channel: None, ids: vec![5] });
+        assert!(app.reply_draft.is_some());
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: None, ids: vec![5] });
+        assert!(app.reply_draft.is_none());
+        app.reply_draft = Some(ReplyDraft { account: "a".into(), peer_id: peer, msg_id: 7, preview: "hi".into() });
+        app.select_account("b".into());
+        assert!(app.reply_draft.is_none());
+    }
+
+    #[test]
+    fn older_forward_completion_does_not_close_a_new_picker() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.forward_draft = Some(ForwardDraft { account: "a".into(), source: peer, msg_id: 2, search: String::new(), request_id: Some(2) });
+        app.apply_event(Evt::ForwardResult { account: "a".into(), destination: peer, request_id: 1, result: Ok(None) });
+        assert_eq!(app.forward_draft.as_ref().unwrap().request_id, Some(2));
+        app.apply_event(Evt::ForwardResult { account: "a".into(), destination: peer, request_id: 2, result: Err("restricted".into()) });
+        assert!(app.forward_draft.is_some());
+        assert_eq!(app.forward_draft.as_ref().unwrap().request_id, None);
+        assert!(app.toast.as_ref().unwrap().0.contains("restricted"));
+    }
+
+    #[test]
+    fn replacement_media_gets_a_distinct_cache_key() {
+        let peer = PeerId::user(1);
+        let old = media_cache_key("a", peer, 10, Some("p123"));
+        let new = media_cache_key("a", peer, 10, Some("p456"));
+        assert_ne!(old, new);
+        assert_ne!(old, media_cache_key("a", peer, 10, Some("d123")));
+        let mut before = photo(10, "caption");
+        before.media_token = Some("p123".into());
+        let mut after = before.clone();
+        after.media_token = Some("p456".into());
+        let mut chat = vec![before];
+        apply_history_change(&mut chat, &HistoryChange::Edit(after));
+        assert_eq!(chat[0].media_token.as_deref(), Some("p456"));
+    }
+
+    #[test]
+    fn edits_deletes_and_inflight_history_respect_account_and_channel_scope() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let user = PeerId::user(1);
+        let channel = PeerId::channel(2);
+        let other_channel = PeerId::channel(3);
+        app.chats.insert(("a".into(), channel), vec![photo(10, "channel")]);
+        app.chats.insert(("a".into(), other_channel), vec![photo(10, "other channel")]);
+        app.chats.insert(("b".into(), user), vec![photo(10, "other account")]);
+        app.request_history("a".into(), user);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        app.apply_event(Evt::Edited { account: "a".into(), peer_id: user, msg: photo(10, "edited") });
+        app.apply_event(Evt::Incoming { account: "a".into(), peer_id: user, msg: photo(11, "new"), peer_name: None, peer_ref: None });
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: None, ids: vec![11] });
+        app.apply_event(Evt::History { account: "a".into(), peer_id: user, messages: vec![photo(10, "old"), photo(11, "deleted")] });
+        assert_eq!(app.chats[&(String::from("a"), user)].len(), 1);
+        assert_eq!(app.chats[&(String::from("a"), user)][0].text, "edited");
+        assert_eq!(app.chats[&(String::from("b"), user)].len(), 1);
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: Some(channel), ids: vec![10] });
+        assert!(app.chats[&(String::from("a"), channel)].is_empty());
+        assert_eq!(app.chats[&(String::from("a"), other_channel)].len(), 1);
+        assert_eq!(app.chats[&(String::from("a"), user)].len(), 1);
+    }
+
+    #[test]
+    fn delete_result_only_removes_on_success_and_history_failure_can_retry() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let key = ("a".to_string(), peer);
+        app.chats.insert(key.clone(), vec![photo(5, "kept")]);
+        app.deleting.insert(("a".into(), peer, 5));
+        app.apply_event(Evt::DeleteResult { account: "a".into(), peer_id: peer, msg_id: 5, result: Err("not allowed".into()) });
+        assert_eq!(app.chats[&key].len(), 1);
+        assert!(!app.deleting.contains(&("a".into(), peer, 5)));
+        assert!(app.toast.as_ref().unwrap().0.contains("not allowed"));
+        app.request_history("a".into(), peer);
+        app.request_history("a".into(), peer);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::OpenChat { .. })));
+        assert!(cmd_rx.try_recv().is_err());
+        app.apply_event(Evt::DeleteResult { account: "a".into(), peer_id: peer, msg_id: 5, result: Ok(()) });
+        app.apply_event(Evt::History { account: "a".into(), peer_id: peer, messages: vec![photo(5, "stale")] });
+        assert!(app.chats[&key].is_empty());
+        while cmd_rx.try_recv().is_ok() {}
+        app.request_history("a".into(), peer);
+        app.apply_event(Evt::HistoryFailed { account: "a".into(), peer_id: peer, message: "offline".into() });
+        app.request_history("a".into(), peer);
+        assert!(app.history_pending.contains_key(&key));
+    }
+
+    #[test]
+    fn stale_dialog_snapshot_cannot_restore_deleted_unread() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let old = Instant::now();
+        app.unread.snapshot("a", peer, 1, 10, 0);
+        app.apply_event(Evt::Deleted { account: "a".into(), channel: None, ids: vec![10] });
+        let cutoff = app.unread_refresh_after["a"];
+        let item = |unread_count, top_message| DialogItem { peer_id: peer, name: "chat".into(), preview: None,
+            unread_count, top_message, read_inbox_max_id: 0, category: Category::User, mute_until: Some(0), pinned: false, resolved: true };
+        app.apply_event(Evt::Dialogs { name: "a".into(), items: vec![item(1, 10)], observed: old - Duration::from_millis(1) });
+        assert!(!app.unread.any());
+        app.apply_event(Evt::Dialogs { name: "a".into(), items: vec![item(0, 9)], observed: cutoff + Duration::from_millis(1) });
+        assert!(!app.unread.any());
+    }
+
+    #[test]
+    fn composer_shift_enter_adds_line_and_enter_sends() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        app.sel_account = Some("a".into());
+        app.sel_peer.insert("a".into(), PeerId::user(1));
+        app.composer = "hello".into();
+        ctx.memory_mut(|m| m.request_focus(composer_id()));
+        let event = |modifiers| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers };
+        ctx.run_ui(egui::RawInput { focused: true, ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput { focused: true, events: vec![egui::Event::ModifiersChanged(egui::Modifiers::SHIFT), event(egui::Modifiers::SHIFT)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        assert!(app.composer.contains('\n'));
+        assert!(cmd_rx.try_recv().is_err());
+        app.composer.push_str("world");
+        app.reply_draft = Some(ReplyDraft { account: "a".into(), peer_id: PeerId::user(1), msg_id: 33, preview: "original".into() });
+        ctx.run_ui(egui::RawInput { focused: true, events: vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE), event(egui::Modifiers::NONE)], ..Default::default() }, |ui| app.ui_chat_view(ui)).drop_without_applying_deltas();
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SendText { text, reply_to: Some(33), .. }) if text.contains('\n') && text.contains("world")));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn send_response_and_update_show_one_photo_in_both_orders() {
+        for (first, second) in [("response", "update"), ("update", "response")] {
+            let mut chat = Vec::new();
+            assert!(upsert_chat_message(&mut chat, photo(42, first)));
+            assert!(!upsert_chat_message(&mut chat, photo(42, second)));
+            assert_eq!(chat.len(), 1);
+            assert_eq!(chat[0].id, 42);
+            assert_eq!(chat[0].text, second);
+            assert!(matches!(&chat[0].media, Some(MsgMedia::Photo)));
+        }
+    }
+
+    #[test]
+    fn sent_and_live_update_events_reconcile_without_unread_or_cross_chat_collisions() {
+        for sent_first in [true, false] {
+            let (cmd_tx, _cmd_rx) = unbounded_channel();
+            let (_evt_tx, evt_rx) = std_mpsc::channel();
+            let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+            let peer = PeerId::user(1);
+            let other_peer = PeerId::user(2);
+            let key = ("account".to_owned(), peer);
+            let other_account_key = ("other".to_owned(), peer);
+            let other_peer_key = ("account".to_owned(), other_peer);
+            app.chats.insert(key.clone(), vec![]);
+            app.chats.insert(other_account_key.clone(), vec![photo(42, "other account")]);
+            app.chats.insert(other_peer_key.clone(), vec![photo(42, "other peer")]);
+            let incoming = Evt::Incoming { account: key.0.clone(), peer_id: peer, msg: photo(42, "update"), peer_name: None, peer_ref: None };
+            let sent = Evt::Sent { account: key.0.clone(), peer_id: peer, result: Ok(photo(42, "sent")), source_path: None,
+                draft: SendDraft { text: "sent".into(), attachment: None, reply_to: None } };
+            if sent_first { app.apply_event(sent); app.apply_event(incoming); }
+            else { app.apply_event(incoming); app.apply_event(sent); }
+            assert_eq!(app.chats[&key].len(), 1);
+            assert!(!app.unread.any());
+            assert_eq!(app.chats[&other_account_key][0].text, "other account");
+            assert_eq!(app.chats[&other_peer_key][0].text, "other peer");
+        }
+    }
+
+    #[test]
+    fn selecting_a_chat_focuses_the_composer() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        app.sel_account = Some("account".into());
+        app.select_peer(PeerId::user(1));
+        assert!(ctx.memory(|memory| memory.has_focus(composer_id())));
+        app.select_account("other".into());
+        ctx.memory_mut(|memory| memory.surrender_focus(composer_id()));
+        app.select_account("account".into());
+        assert!(!ctx.memory(|memory| memory.has_focus(composer_id())));
+        assert!(!app.sel_peer.contains_key("account"));
+    }
+
+    #[test]
+    fn only_focused_loaded_chat_is_marked_read_and_old_ack_keeps_new_message() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, ctx.clone());
+        let peer = PeerId::user(1);
+        let key = ("account".to_string(), peer);
+        app.sel_account = Some(key.0.clone());
+        app.sel_peer.insert(key.0.clone(), peer);
+        app.chats.insert(key.clone(), vec![photo(10, "loaded")]);
+        app.unread.incoming(&key.0, peer, 10);
+
+        let raw = egui::RawInput { focused: false, ..Default::default() };
+        ctx.run_ui(raw, |ui| app.mark_visible_chat_read(ui.ctx())).drop_without_applying_deltas();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app.unread.any());
+
+        let raw = egui::RawInput { focused: true, ..Default::default() };
+        ctx.run_ui(raw, |ui| app.mark_visible_chat_read(ui.ctx())).drop_without_applying_deltas();
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::MarkRead { max_id: 10, .. })));
+        app.unread.incoming(&key.0, peer, 11);
+        app.apply_event(Evt::ReadResult { account: key.0.clone(), peer_id: peer, max_id: 10, result: Ok(()) });
+        assert_eq!(app.unread.newest(&key.0, peer), Some(11));
+        app.apply_event(Evt::ReadUpdate { account: key.0.clone(), peer_id: peer, max_id: 11, remaining: 0 });
+        assert!(!app.unread.any());
+    }
+
+    #[test]
+    fn mute_events_filter_alarms_but_keep_unread_and_failed_sync_retries() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1); let t = Instant::now();
+        app.unread.incoming("account", peer, 10);
+        app.apply_event(Evt::Dialogs { name: "account".into(), observed: t, items: vec![DialogItem {
+            peer_id: peer, name: "person".into(), preview: None, unread_count: 1,
+            top_message: 10, read_inbox_max_id: 0, category: Category::User, mute_until: Some(i32::MAX), pinned: false, resolved: true,
+        }] });
+        assert_eq!(app.unread.count("account", peer), 1);
+        assert!(!app.unread.any_alertable(&app.notifications, 100));
+        app.apply_event(Evt::NotifyPeer { account: "account".into(), peer_id: peer, until: Some(0), observed: t + Duration::from_secs(1) });
+        assert!(app.unread.any_alertable(&app.notifications, 100));
+        app.apply_event(Evt::NotifyDefault { account: "account".into(), category: Category::User, result: Err("offline".into()), observed: t });
+        app.apply_event(Evt::NotifyDefault { account: "account".into(), category: Category::Group, result: Ok(Some(0)), observed: t });
+        assert!(app.notify_retry.contains_key("account"));
+        assert!(!app.unread.any_alertable(&app.notifications, 100));
+        app.apply_event(Evt::NotifySyncComplete { account: "account".into(), successful: false });
+        assert!(app.notify_retry.contains_key("account"));
+        app.apply_event(Evt::NotifySyncComplete { account: "account".into(), successful: true });
+        assert!(!app.notify_retry.contains_key("account"));
+        assert!(app.unread.any_alertable(&app.notifications, 100));
+    }
+
+    #[test]
+    fn live_incoming_is_unread_even_if_history_cached_it_first() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        let mut msg = photo(10, "incoming");
+        msg.outgoing = false;
+        app.chats.insert(("account".into(), peer), vec![msg.clone()]);
+        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg: msg.clone(), peer_name: None, peer_ref: None });
+        app.apply_event(Evt::Incoming { account: "account".into(), peer_id: peer, msg, peer_name: None, peer_ref: None });
+        assert_eq!(app.unread.count("account", peer), 1);
+        assert_eq!(app.chats[&(String::from("account"), peer)].len(), 1);
+    }
+
+    #[test]
+    fn failed_read_leaves_unread_and_alarm_state() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        let peer = PeerId::user(1);
+        app.unread.incoming("account", peer, 7);
+        app.apply_event(Evt::ReadResult { account: "account".into(), peer_id: peer, max_id: 7, result: Err("offline".into()) });
+        assert!(app.unread.any());
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn global_alarm_toggle_stops_and_resumes_without_losing_unread() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test();
+        app.cfg.accounts = vec![account("one"), account("two")];
+        let peer = PeerId::user(1);
+        let now = Instant::now();
+        for account in ["one", "two"] {
+            app.unread.incoming(account, peer, 10);
+            app.notifications.set_peer(account, peer, Some(0), now);
+        }
+        app.sync_alarm();
+        assert!(app.alarm.is_active());
+        app.set_alarm_enabled(false);
+        assert!(!app.alarm.is_active());
+        assert_eq!(app.unread.count("one", peer), 1);
+        assert_eq!(app.unread.count("two", peer), 1);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetAlarmEnabled { enabled: false, request_id: 1 })));
+
+        // An unrelated old worker configuration must not undo the immediate UI choice.
+        let cfg = Config { accounts: vec![account("one"), account("two")], ..Config::default() };
+        app.apply_event(Evt::Config(cfg));
+        assert!(!app.alarm_enabled);
+        app.set_alarm_enabled(true);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetAlarmEnabled { enabled: true, request_id: 2 })));
+        // Re-add unread entries because the config event above had no accounts.
+        app.unread.incoming("one", peer, 11);
+        app.notifications.set_peer("one", peer, Some(0), now);
+        app.sync_alarm();
+        assert!(app.alarm.is_active());
+        app.apply_event(Evt::AlarmSettingSaved { request_id: 1, result: Ok(()) });
+        assert!(app.alarm_enabled);
+        assert_eq!(app.pending_alarm_request, Some(2));
+        app.apply_event(Evt::AlarmSettingSaved { request_id: 2, result: Ok(()) });
+        assert_eq!(app.pending_alarm_request, None);
+        assert!(app.cfg.alarm_enabled);
+    }
+
+    #[test]
+    fn failed_alarm_save_keeps_current_session_choice_and_warns() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test();
+        app.set_alarm_enabled(false);
+        app.apply_event(Evt::AlarmSettingSaved { request_id: 1, result: Err("read-only".into()) });
+        assert!(!app.alarm_enabled);
+        assert!(!app.cfg.alarm_enabled);
+        assert!(!app.alarm.is_active());
+        assert!(app.toast.as_ref().unwrap().0.contains("could not be saved"));
+        assert!(app.alarm_save_error.is_some());
+    }
+
+    #[test]
+    fn account_alarms_filter_independently_and_global_override_wins() {
+        let (tx, mut rx) = unbounded_channel(); let (_evt_tx, events) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a"), account("b")], ..Config::default() };
+        let mut app = TelegramApp::new(cfg, tx, events, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test();
+        let peer = PeerId::user(3);
+        for name in ["a", "b"] { app.unread.incoming(name, peer, 1); app.notifications.set_peer(name, peer, Some(0), Instant::now()); }
+        app.sync_alarm(); assert!(app.alarm.is_active());
+        app.set_account_setting("a", false, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::SetAccountAlarm { name, enabled: false, .. }) if name == "a"));
+        assert!(app.alarm.is_active());
+        app.set_account_setting("b", false, false); assert!(!app.alarm.is_active());
+        assert_eq!(app.unread.count("a", peer), 1); assert_eq!(app.unread.count("b", peer), 1);
+        app.apply_event(Evt::AccountSettingSaved { name: "a".into(), connection: false, request_id: 1, result: Ok(()) });
+        app.set_account_setting("a", false, true); assert!(app.alarm.is_active());
+        app.set_alarm_enabled(false); assert!(!app.alarm.is_active());
+        app.set_alarm_enabled(true); assert!(app.alarm.is_active());
+    }
+
+    #[test]
+    fn disabled_account_retains_unread_but_stops_alarm_and_retries() {
+        let (tx, mut rx) = unbounded_channel(); let (_evt_tx, events) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a")], ..Config::default() };
+        let mut app = TelegramApp::new(cfg.clone(), tx, events, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test(); let peer = PeerId::user(9);
+        app.unread.incoming("a", peer, 10); app.notifications.set_peer("a", peer, Some(0), Instant::now());
+        app.sync_alarm(); assert!(app.alarm.is_active());
+        app.set_account_setting("a", true, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::SetAccountEnabled { enabled: false, .. })));
+        assert!(!app.alarm.is_active()); assert_eq!(app.unread.count("a", peer), 1);
+        assert!(app.status.get("a") == Some(&ConnStatus::Disabled));
+        app.apply_event(Evt::Status { name: "a".into(), status: ConnStatus::Online });
+        assert!(app.status.get("a") == Some(&ConnStatus::Disabled));
+        app.apply_event(Evt::Config(cfg)); // stale snapshot must not revert the pending change
+        assert!(!app.cfg.find_account("a").unwrap().enabled);
+        app.request_dialog_refresh("a"); app.pump_dialog_refreshes(Instant::now());
+        assert!(rx.try_recv().is_err());
+        app.apply_event(Evt::AccountSettingSaved { name: "a".into(), connection: true, request_id: 1, result: Ok(()) });
+        app.set_account_setting("a", true, true);
+        assert!(!app.alarm.is_active()); // wait for fresh notification settings
+        app.apply_event(Evt::NotifySyncComplete { account: "a".into(), successful: true });
+        app.sync_alarm(); assert!(app.alarm.is_active());
+    }
+
+    #[test]
+    fn account_save_failure_is_visible_and_unsaved_choice_is_retained() {
+        let (tx, _rx) = unbounded_channel(); let (_evt_tx, events) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a")], ..Config::default() };
+        let mut app = TelegramApp::new(cfg, tx, events, PathBuf::new(), false, egui::Context::default());
+        app.set_account_setting("a", false, false);
+        app.apply_event(Evt::AccountSettingSaved { name: "a".into(), connection: false, request_id: 1, result: Err("read-only".into()) });
+        assert!(!app.cfg.find_account("a").unwrap().alarm_enabled);
+        assert!(app.account_setting_errors.contains_key(&("a".into(), false)));
+        assert!(app.toast.as_ref().unwrap().0.contains("could not be saved"));
+    }
+
+    #[tokio::test]
+    async fn worker_disable_preserves_session_file_and_persists_preferences() {
+        let dir = std::env::temp_dir().join(format!("mlxysftele-account-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(util::sessions_dir(&dir)).unwrap();
+        let path = util::session_path(&dir, "a"); std::fs::write(&path, b"session sentinel").unwrap();
+        let (evt_tx, evt_rx) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a"), account("b")], ..Config::default() };
+        let mut worker = Worker { data_dir: dir.clone(), cfg, evt_tx, ctx: egui::Context::default(),
+            conns: HashMap::new(), pending_logins: HashMap::new(), media_objects: HashMap::new() };
+        worker.set_account_alarm("a".into(), false, 1);
+        worker.set_account_enabled("a".into(), false, 2).await;
+        let saved = Config::load(&dir).unwrap();
+        assert!(!saved.find_account("a").unwrap().enabled); assert!(!saved.find_account("a").unwrap().alarm_enabled);
+        assert!(saved.find_account("b").unwrap().enabled); assert_eq!(std::fs::read(&path).unwrap(), b"session sentinel");
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::AccountSettingSaved { connection: false, result: Ok(()), .. })));
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::Status { status: ConnStatus::Disabled, .. })));
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::AccountSettingSaved { connection: true, result: Ok(()), .. })));
+        worker.bring_online("a".into()).await;
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::Status { status: ConnStatus::Disabled, .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), b"session sentinel");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_persists_global_alarm_choice() {
+        let dir = std::env::temp_dir().join(format!("mlxysftele-alarm-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let (evt_tx, evt_rx) = std_mpsc::channel();
+        let mut worker = Worker { data_dir: dir.clone(), cfg: Config::default(), evt_tx, ctx: egui::Context::default(),
+            conns: HashMap::new(), pending_logins: HashMap::new(), media_objects: HashMap::new() };
+        worker.set_alarm_enabled(false, 7);
+        assert!(!Config::load(&dir).unwrap().alarm_enabled);
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::AlarmSettingSaved { request_id: 7, result: Ok(()) })));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn distinct_message_ids_are_not_deduplicated_and_cache_is_bounded() {
+        let mut chat = Vec::new();
+        for id in 0..=MAX_CACHED_MESSAGES as i32 {
+            assert!(upsert_chat_message(&mut chat, photo(id, "same image")));
+        }
+        assert_eq!(chat.len(), MAX_CACHED_MESSAGES);
+        assert_eq!(chat[0].id, 1);
+        assert_eq!(chat.last().unwrap().id, MAX_CACHED_MESSAGES as i32);
+    }
+}
