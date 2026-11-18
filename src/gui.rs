@@ -8,8 +8,8 @@
 //! * Events flow back over a std mpsc channel; the worker calls
 //!   [`egui::Context::request_repaint`] after every event so the UI reacts
 //!   instantly without any busy polling.
-//! * **Every registered account keeps a live connection for the lifetime of
-//!   the process** — "accounts stay active". There is no lazy connect, no
+//! * **Every enabled account keeps a live connection for the lifetime of
+//!   the process**, unless manually disabled in Settings. There is no lazy connect, no
 //!   idle reaper, no hot-set here; that was the superseded headless daemon
 //!   model. An account that fails to authenticate is shown as signed-out in
 //!   the sidebar instead of being dropped.
@@ -86,6 +86,8 @@ enum Cmd {
     /// Flip a local premium flag (`None` = master switch).
     SetLocalPremium { flag: Option<String>, on: bool },
     SetAlarmEnabled { enabled: bool, request_id: u64 },
+    SetAccountAlarm { name: String, enabled: bool, request_id: u64 },
+    SetAccountEnabled { name: String, enabled: bool, request_id: u64 },
 }
 
 #[derive(Clone)]
@@ -395,6 +397,7 @@ struct MeInfo {
 
 #[derive(Clone, PartialEq, Eq)]
 enum ConnStatus {
+    Disabled,
     Connecting,
     Online,
     Unauthorized,
@@ -419,6 +422,7 @@ enum Evt {
     NotifySyncError { account: String, message: String },
     NotifySyncComplete { account: String, successful: bool },
     AlarmSettingSaved { request_id: u64, result: Result<(), String> },
+    AccountSettingSaved { name: String, connection: bool, request_id: u64, result: Result<(), String> },
     NotifyDefault { account: String, category: Category, result: Result<Option<i32>, String>, observed: Instant },
     History { account: String, peer_id: PeerId, messages: Vec<MsgItem> },
     Incoming { account: String, peer_id: PeerId, msg: MsgItem, peer_name: Option<String>, peer_ref: Option<PeerRef> },
@@ -658,6 +662,8 @@ fn spawn_media_download(
 struct AccountConn {
     client: Client,
     pool: tokio::task::JoinHandle<()>,
+    stop_updates: Option<tokio::sync::oneshot::Sender<()>>,
+    updates_task: Option<tokio::task::JoinHandle<()>>,
     /// Latest known peers, refreshed with every dialog list fetch.
     peer_refs: HashMap<PeerId, PeerRef>,
 }
@@ -722,6 +728,11 @@ impl Worker {
     /// Connect one account, verify auth, capture identity, start keep-alive
     /// update stream. Failures still report a status so the GUI can show it.
     async fn bring_online(&mut self, name: String) {
+        if !self.cfg.find_account(&name).is_some_and(|a| a.enabled) {
+            self.emit(Evt::Status { name, status: ConnStatus::Disabled });
+            return;
+        }
+        if self.conns.contains_key(&name) { return; }
         let Ok((api_id, _)) = self.api_creds() else {
             self.emit(Evt::Status {
                 name,
@@ -778,7 +789,8 @@ impl Worker {
         let data_dir = self.data_dir.clone();
         let update_client = client.clone();
         let download_client = client.clone();
-        if let Some(updates_rx) = updates {
+        let (stop_updates, mut stop_rx) = tokio::sync::oneshot::channel();
+        let updates_task = updates.map(|updates_rx| {
             tokio::spawn(async move {
                 let mut stream = update_client
                     .stream_updates(
@@ -787,7 +799,11 @@ impl Worker {
                     )
                     .await;
                 loop {
-                    match stream.next().await {
+                    let next = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        next = stream.next() => next,
+                    };
+                    match next {
                         Ok(Update::NewMessage(message)) => {
                             let media = split_media(&message);
                             let msg_id = message.id();
@@ -906,9 +922,9 @@ impl Worker {
                 // Update stream ended; persist the sync state so the next
                 // session starts from a consistent point.
                 stream.sync_update_state().await;
-            });
-        }
-        self.conns.insert(name.clone(), AccountConn { client, pool, peer_refs: HashMap::new() });
+            })
+        });
+        self.conns.insert(name.clone(), AccountConn { client, pool, stop_updates: Some(stop_updates), updates_task, peer_refs: HashMap::new() });
 
         // Pre-load dialogs so the chat list is warm.
         self.refresh_dialogs(&name, None).await;
@@ -1281,6 +1297,7 @@ impl Worker {
             .find_account(name)
             .map(|a| a.created_unix)
             .unwrap_or(now);
+        let (enabled, alarm_enabled) = self.cfg.find_account(name).map(|a| (a.enabled, a.alarm_enabled)).unwrap_or((true, true));
         self.cfg.upsert_account(AccountMeta {
             name: name.to_string(),
             phone: Some(phone.to_string()),
@@ -1288,6 +1305,7 @@ impl Worker {
             username: user.username().map(str::to_string),
             created_unix: created,
             last_login_unix: Some(now),
+            enabled, alarm_enabled,
         });
         if let Err(e) = self.cfg.save(&self.data_dir) {
             log_warn!("failed to save config after login: {e}");
@@ -1417,8 +1435,30 @@ impl Worker {
         self.bring_online(name).await;
     }
 
+    async fn stop_updates(conn: &mut AccountConn) {
+        if let Some(stop) = conn.stop_updates.take() { let _ = stop.send(()); }
+        if let Some(mut task) = conn.updates_task.take() {
+            if tokio::time::timeout(Duration::from_secs(3), &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    async fn disconnect_account(&mut self, name: &str) {
+        if let Some(mut conn) = self.conns.remove(name) {
+            Self::stop_updates(&mut conn).await;
+            telegram::shutdown(conn.client, conn.pool).await;
+        }
+    }
+
     async fn logout(&mut self, name: String) {
-        if let Some(conn) = self.conns.remove(&name) {
+        if self.cfg.find_account(&name).is_some_and(|a| !a.enabled) {
+            self.emit(Evt::Toast(format!("[{name}] Enable this account before signing out on Telegram")));
+            return;
+        }
+        if let Some(mut conn) = self.conns.remove(&name) {
+            Self::stop_updates(&mut conn).await;
             match conn.client.sign_out().await {
                 Ok(_) => log_info_toast(self, format!("[{name}] signed out on Telegram")),
                 Err(e) => {
@@ -1431,11 +1471,8 @@ impl Worker {
         self.wipe_local(&name);
     }
 
-    fn remove_local(&mut self, name: String) {
-        if let Some(conn) = self.conns.remove(&name) {
-            let (client, pool) = (conn.client, conn.pool);
-            tokio::spawn(async move { telegram::shutdown(client, pool).await });
-        }
+    async fn remove_local(&mut self, name: String) {
+        self.disconnect_account(&name).await;
         self.wipe_local(&name);
     }
 
@@ -1478,6 +1515,31 @@ impl Worker {
         self.emit(Evt::AlarmSettingSaved { request_id, result });
     }
 
+    fn set_account_alarm(&mut self, name: String, enabled: bool, request_id: u64) {
+        let result = if let Some(account) = self.cfg.find_account_mut(&name) {
+            account.alarm_enabled = enabled;
+            self.cfg.save(&self.data_dir).map_err(|e| e.to_string())
+        } else { Err("account no longer exists".into()) };
+        self.emit(Evt::AccountSettingSaved { name, connection: false, request_id, result });
+    }
+
+    async fn set_account_enabled(&mut self, name: String, enabled: bool, request_id: u64) {
+        let result = if let Some(account) = self.cfg.find_account_mut(&name) {
+            account.enabled = enabled;
+            self.cfg.save(&self.data_dir).map_err(|e| e.to_string())
+        } else {
+            self.emit(Evt::AccountSettingSaved { name, connection: true, request_id, result: Err("account no longer exists".into()) });
+            return;
+        };
+        if enabled {
+            self.bring_online(name.clone()).await;
+        } else {
+            self.disconnect_account(&name).await;
+            self.emit(Evt::Status { name: name.clone(), status: ConnStatus::Disabled });
+        }
+        self.emit(Evt::AccountSettingSaved { name, connection: true, request_id, result });
+    }
+
     fn save_creds(&mut self, api_id: i32, api_hash: String) {
         self.cfg.api_id = Some(api_id);
         self.cfg.api_hash = Some(api_hash);
@@ -1492,8 +1554,8 @@ impl Worker {
     async fn run(mut self, mut cmd_rx: UnboundedReceiver<Cmd>) {
         // Announce the starting config right away.
         self.broadcast_config();
-        // Bring every registered account online — they STAY online.
-        let names: Vec<String> = self.cfg.accounts.iter().map(|a| a.name.clone()).collect();
+        // Disabled accounts remain registered without opening their sessions.
+        let names: Vec<String> = self.cfg.accounts.iter().filter(|a| a.enabled).map(|a| a.name.clone()).collect();
         for name in names {
             // Each connection is independent; failures are reported per account.
             self.bring_online(name).await;
@@ -1507,6 +1569,7 @@ impl Worker {
                         .cfg
                         .accounts
                         .iter()
+                        .filter(|a| a.enabled)
                         .map(|a| a.name.clone())
                         .filter(|n| !self.conns.contains_key(n))
                         .collect();
@@ -1543,9 +1606,11 @@ impl Worker {
                 Cmd::SubmitCode { name, code } => self.submit_code(name, code).await,
                 Cmd::SubmitPassword { name, password } => self.submit_password(name, password).await,
                 Cmd::Logout { name } => self.logout(name).await,
-                Cmd::RemoveLocal { name } => self.remove_local(name),
+                Cmd::RemoveLocal { name } => self.remove_local(name).await,
                 Cmd::SetLocalPremium { flag, on } => self.set_local_premium(flag, on),
                 Cmd::SetAlarmEnabled { enabled, request_id } => self.set_alarm_enabled(enabled, request_id),
+                Cmd::SetAccountAlarm { name, enabled, request_id } => self.set_account_alarm(name, enabled, request_id),
+                Cmd::SetAccountEnabled { name, enabled, request_id } => self.set_account_enabled(name, enabled, request_id).await,
             }
         }
     }
@@ -1697,6 +1762,9 @@ struct TelegramApp {
     alarm_request_id: u64,
     pending_alarm_request: Option<u64>,
     alarm_save_error: Option<String>,
+    next_account_setting_id: u64,
+    pending_account_settings: HashMap<(String, bool), u64>,
+    account_setting_errors: HashMap<(String, bool), String>,
     alarm_errors: std_mpsc::Receiver<String>,
     composer: String,
     toast: Option<(String, Instant)>,
@@ -1767,6 +1835,9 @@ impl TelegramApp {
             alarm_request_id: 0,
             pending_alarm_request: None,
             alarm_save_error: None,
+            next_account_setting_id: 0,
+            pending_account_settings: HashMap::new(),
+            account_setting_errors: HashMap::new(),
             alarm_errors,
             composer: String::new(),
             toast: None,
@@ -1791,7 +1862,8 @@ impl TelegramApp {
             picker_show_all: false,
         };
         for account in app.cfg.accounts.clone() {
-            app.status.insert(account.name.clone(), ConnStatus::Connecting);
+            app.status.insert(account.name.clone(), if account.enabled { ConnStatus::Connecting } else { ConnStatus::Disabled });
+            if !account.enabled { app.notifications.set_sync_failed(&account.name, true); }
         }
         app.sel_account = app.cfg.accounts.first().map(|a| a.name.clone());
         app
@@ -1799,10 +1871,19 @@ impl TelegramApp {
 
     fn apply_event(&mut self, evt: Evt) {
         match evt {
-            Evt::Config(cfg) => {
+            Evt::Config(mut cfg) => {
+                // In-flight optimistic toggles take precedence over older config snapshots.
+                for account in &mut cfg.accounts {
+                    if let Some(current) = self.cfg.find_account(&account.name) {
+                        if self.pending_account_settings.contains_key(&(account.name.clone(), true)) { account.enabled = current.enabled; }
+                        if self.pending_account_settings.contains_key(&(account.name.clone(), false)) { account.alarm_enabled = current.alarm_enabled; }
+                    }
+                }
                 let known: std::collections::HashSet<String> =
                     cfg.accounts.iter().map(|a| a.name.clone()).collect();
                 self.status.retain(|k, _| known.contains(k));
+                self.pending_account_settings.retain(|(name, _), _| known.contains(name));
+                self.account_setting_errors.retain(|(name, _), _| known.contains(name));
                 self.me.retain(|k, _| known.contains(k));
                 self.dialogs.retain(|k, _| known.contains(k));
                 self.sel_peer.retain(|k, _| known.contains(k));
@@ -1831,7 +1912,7 @@ impl TelegramApp {
                     }
                 }
                 for account in &cfg.accounts {
-                    self.status.entry(account.name.clone()).or_insert(ConnStatus::Connecting);
+                    self.status.entry(account.name.clone()).or_insert(if account.enabled { ConnStatus::Connecting } else { ConnStatus::Disabled });
                 }
                 if self.pending_alarm_request.is_none() {
                     self.alarm_enabled = cfg.alarm_enabled;
@@ -1852,7 +1933,23 @@ impl TelegramApp {
                     }
                 }
             }
+            Evt::AccountSettingSaved { name, connection, request_id, result } => {
+                let key = (name.clone(), connection);
+                if self.pending_account_settings.get(&key) == Some(&request_id) {
+                    self.pending_account_settings.remove(&key);
+                    match result {
+                        Ok(()) => { self.account_setting_errors.remove(&key); }
+                        Err(error) => {
+                            self.account_setting_errors.insert(key, error.clone());
+                            self.toast = Some((format!("[{name}] setting applies this session but could not be saved: {error}"), Instant::now()));
+                        }
+                    }
+                }
+            }
             Evt::Status { name, status } => {
+                if let Some(account) = self.cfg.find_account(&name) {
+                    if (!account.enabled && status != ConnStatus::Disabled) || (account.enabled && status == ConnStatus::Disabled) { return; }
+                }
                 if status == ConnStatus::Online {
                     self.dialog_refresh.entry(name.clone()).or_default().last_success = Some(Instant::now());
                 }
@@ -1919,6 +2016,7 @@ impl TelegramApp {
                 self.toast = Some((format!("Could not load chats; alarm may be delayed: {message}"), Instant::now()));
             }
             Evt::NotifySyncComplete { account, successful } => {
+                if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) { return; }
                 if successful {
                     self.notifications.set_sync_failed(&account, false);
                     self.notify_retry.remove(&account);
@@ -2233,6 +2331,7 @@ impl TelegramApp {
     }
 
     fn request_dialog_refresh(&mut self, account: &str) {
+        if self.cfg.find_account(account).is_some_and(|a| !a.enabled) { return; }
         self.dialog_refresh.entry(account.to_owned()).or_default().dirty = true;
         self.ctx.request_repaint();
     }
@@ -2242,7 +2341,7 @@ impl TelegramApp {
     fn pump_dialog_refreshes(&mut self, now: Instant) {
         let mut wait: Option<Duration> = None;
         for (account, state) in &mut self.dialog_refresh {
-            if !state.dirty || state.pending.is_some() { continue; }
+            if self.cfg.find_account(account).is_some_and(|a| !a.enabled) || !state.dirty || state.pending.is_some() { continue; }
             let cooldown = state.last_request.map(|t| t + REFRESH_COOLDOWN).unwrap_or(now);
             let due = state.retry_at.unwrap_or(now).max(cooldown);
             if due > now {
@@ -2331,8 +2430,36 @@ impl TelegramApp {
         }
     }
 
+    fn set_account_setting(&mut self, name: &str, connection: bool, enabled: bool) {
+        let key = (name.to_owned(), connection);
+        if self.pending_account_settings.contains_key(&key) || self.cfg.find_account(name).is_none() { return; }
+        self.next_account_setting_id = self.next_account_setting_id.wrapping_add(1);
+        let request_id = self.next_account_setting_id;
+        let cmd = if connection { Cmd::SetAccountEnabled { name: name.into(), enabled, request_id } }
+            else { Cmd::SetAccountAlarm { name: name.into(), enabled, request_id } };
+        if self.cmd_tx.send(cmd).is_err() {
+            self.account_setting_errors.insert(key, "worker stopped; no change applied".into());
+            self.toast = Some(("Account setting failed: worker stopped".into(), Instant::now()));
+            return;
+        }
+        self.pending_account_settings.insert(key.clone(), request_id);
+        self.account_setting_errors.remove(&key);
+        if let Some(account) = self.cfg.find_account_mut(name) {
+            if connection { account.enabled = enabled; } else { account.alarm_enabled = enabled; }
+        }
+        if connection {
+            self.status.insert(name.to_owned(), if enabled { ConnStatus::Connecting } else { ConnStatus::Disabled });
+            self.notifications.set_sync_failed(name, true);
+            if !enabled { self.notify_retry.remove(name); }
+        }
+        self.sync_alarm();
+    }
+
     fn sync_alarm(&mut self) {
-        let active = self.alarm_enabled && self.unread.any_alertable(&self.notifications, util::now_unix());
+        let now = util::now_unix();
+        let active = self.alarm_enabled && self.cfg.accounts.iter().any(|account| {
+            account.enabled && account.alarm_enabled && self.unread.account_counts(&account.name, &self.notifications, now).1 > 0
+        });
         self.alarm.set_active(active);
     }
 
@@ -2386,6 +2513,7 @@ impl TelegramApp {
 
     fn select_peer(&mut self, peer_id: PeerId) {
         if let Some(account) = self.sel_account.clone() {
+            if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) { return; }
             if self.sel_peer.get(&account) != Some(&peer_id) { self.reply_draft = None; }
             self.sel_peer.insert(account.clone(), peer_id);
             self.ctx.memory_mut(|memory| memory.request_focus(composer_id()));
@@ -2445,6 +2573,7 @@ fn premium_set_local(t: &mut PremiumToggles, key: &str, on: bool) {
 
 fn status_color(status: &ConnStatus) -> egui::Color32 {
     match status {
+        ConnStatus::Disabled => egui::Color32::from_gray(110),
         ConnStatus::Online => egui::Color32::from_rgb(52, 211, 103),
         ConnStatus::Connecting => egui::Color32::from_rgb(255, 176, 46),
         ConnStatus::Unauthorized => egui::Color32::from_rgb(154, 154, 154),
@@ -2454,6 +2583,7 @@ fn status_color(status: &ConnStatus) -> egui::Color32 {
 
 fn status_tooltip(status: &ConnStatus) -> String {
     match status {
+        ConnStatus::Disabled => "disabled locally — session kept; enable in Settings to reconnect".into(),
         ConnStatus::Online => "connected — this account stays active".into(),
         ConnStatus::Connecting => "connecting…".into(),
         ConnStatus::Unauthorized => "session not authorized — remove and re-add the account".into(),
@@ -2673,6 +2803,7 @@ impl TelegramApp {
             return;
         }
         let Some(account) = self.sel_account.clone() else { return };
+        if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) { return; }
         let Some(&peer_id) = self.sel_peer.get(&account) else { return };
         let key = (account.clone(), peer_id);
         let Some(history) = self.chats.get(&key) else { return };
@@ -2803,6 +2934,7 @@ impl TelegramApp {
                         egui::Color32::from_gray(150),
                     );
                     let warning = match &status {
+                        ConnStatus::Disabled => Some(("disabled", egui::Color32::from_gray(160))),
                         ConnStatus::Error(_) => Some(("offline", egui::Color32::from_rgb(255, 95, 86))),
                         ConnStatus::Unauthorized => Some(("sign in", egui::Color32::from_rgb(255, 175, 85))),
                         _ if refresh_failed => Some(("sync !", egui::Color32::from_rgb(255, 175, 85))),
@@ -2842,7 +2974,7 @@ impl TelegramApp {
                 };
                 // on_hover_text consumes the response; read the click state first.
                 let clicked = response.clicked();
-                let sync = if refresh_failed { "\nChat refresh failed; retrying" } else { "" };
+                let sync = if !account.enabled { "\nCached unread counts may be out of date" } else if refresh_failed { "\nChat refresh failed; retrying" } else { "" };
                 response.on_hover_text(format!("{hover}\n{}\n{unread} unread ({alertable} unmuted){sync}", status_tooltip(&status)));
                 if clicked {
                     clicked_name = Some(name);
@@ -2968,6 +3100,15 @@ impl TelegramApp {
             self.ui_welcome(ui);
             return;
         };
+        if self.cfg.find_account(&account).is_some_and(|a| !a.enabled) {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(egui::RichText::new("Account disabled").size(18.0).weak());
+                ui.label("Enable this account in Settings to reconnect. Your session is kept.");
+                ui.label("Unread counts are cached and may be out of date while disabled.");
+            });
+            return;
+        }
         let Some(peer_id) = self.sel_peer.get(&account).copied() else {
             ui.add_space(80.0);
             ui.vertical_centered(|ui| {
@@ -3993,10 +4134,32 @@ impl TelegramApp {
                 if self.cfg.accounts.is_empty() {
                     ui.label(egui::RichText::new("no accounts registered yet").weak());
                 }
+                ui.label(egui::RichText::new("Account alarm switches are local and obey the global alarm switch and Telegram chat mutes. Disabled accounts keep their sessions but do not sync or sound alarms.").weak().small());
                 for account in self.cfg.accounts.clone() {
+                    let name = account.name.clone();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(truncate(&name, 20)).strong());
+                        let mut connected = account.enabled;
+                        let busy = self.pending_account_settings.contains_key(&(name.clone(), true));
+                        if ui.add_enabled(!busy, egui::Checkbox::new(&mut connected, "Account enabled"))
+                            .on_hover_text("Disable to disconnect without signing out; enable to reconnect").changed() {
+                            self.set_account_setting(&name, true, connected);
+                        }
+                        let mut alarm = account.alarm_enabled;
+                        let alarm_busy = self.pending_account_settings.contains_key(&(name.clone(), false));
+                        if ui.add_enabled(!alarm_busy, egui::Checkbox::new(&mut alarm, "Alarm"))
+                            .on_hover_text("Allow this account's unmuted unread messages to sound the global alarm").changed() {
+                            self.set_account_setting(&name, false, alarm);
+                        }
+                        if busy || alarm_busy { ui.label("Applying…"); }
+                    });
+                    for connection in [true, false] {
+                        if let Some(error) = self.account_setting_errors.get(&(name.clone(), connection)) {
+                            ui.colored_label(egui::Color32::YELLOW, format!("{} setting not saved: {error}", if connection { "Account" } else { "Alarm" }));
+                        }
+                    }
                     ui.horizontal(|ui| {
                         let name = account.name.clone();
-                        ui.label(egui::RichText::new(&name).strong());
                         let caption = account
                             .username
                             .as_ref()
@@ -4007,7 +4170,8 @@ impl TelegramApp {
 
                         let confirm_logout = self.confirm_logout.as_deref() == Some(name.as_str());
                         if ui
-                            .button(if confirm_logout { "Confirm sign out?" } else { "Sign out" })
+                            .add_enabled(account.enabled && !self.pending_account_settings.contains_key(&(name.clone(), true)), egui::Button::new(if confirm_logout { "Confirm sign out?" } else { "Sign out" }))
+                            .on_hover_text("Enable the account before signing out on Telegram")
                             .clicked()
                         {
                             if confirm_logout {
@@ -4201,6 +4365,11 @@ impl TelegramApp {
 #[cfg(test)]
 mod message_cache_tests {
     use super::*;
+
+    fn account(name: &str) -> AccountMeta {
+        AccountMeta { name: name.into(), phone: None, user_id: None, username: None,
+            created_unix: 0, last_login_unix: None, enabled: true, alarm_enabled: true }
+    }
 
     fn photo(id: i32, text: &str) -> MsgItem {
         MsgItem { id, outgoing: true, edited: false, unix: 1, text: text.into(), media: Some(MsgMedia::Photo), media_token: None, reply: None, forwarded: None, reactions: vec![] }
@@ -4825,6 +4994,7 @@ mod message_cache_tests {
         let (_evt_tx, evt_rx) = std_mpsc::channel();
         let mut app = TelegramApp::new(Config::default(), cmd_tx, evt_rx, PathBuf::new(), false, egui::Context::default());
         app.alarm = Alarm::silent_for_test();
+        app.cfg.accounts = vec![account("one"), account("two")];
         let peer = PeerId::user(1);
         let now = Instant::now();
         for account in ["one", "two"] {
@@ -4840,7 +5010,8 @@ mod message_cache_tests {
         assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetAlarmEnabled { enabled: false, request_id: 1 })));
 
         // An unrelated old worker configuration must not undo the immediate UI choice.
-        app.apply_event(Evt::Config(Config::default()));
+        let cfg = Config { accounts: vec![account("one"), account("two")], ..Config::default() };
+        app.apply_event(Evt::Config(cfg));
         assert!(!app.alarm_enabled);
         app.set_alarm_enabled(true);
         assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetAlarmEnabled { enabled: true, request_id: 2 })));
@@ -4870,6 +5041,87 @@ mod message_cache_tests {
         assert!(!app.alarm.is_active());
         assert!(app.toast.as_ref().unwrap().0.contains("could not be saved"));
         assert!(app.alarm_save_error.is_some());
+    }
+
+    #[test]
+    fn account_alarms_filter_independently_and_global_override_wins() {
+        let (tx, mut rx) = unbounded_channel(); let (_evt_tx, events) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a"), account("b")], ..Config::default() };
+        let mut app = TelegramApp::new(cfg, tx, events, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test();
+        let peer = PeerId::user(3);
+        for name in ["a", "b"] { app.unread.incoming(name, peer, 1); app.notifications.set_peer(name, peer, Some(0), Instant::now()); }
+        app.sync_alarm(); assert!(app.alarm.is_active());
+        app.set_account_setting("a", false, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::SetAccountAlarm { name, enabled: false, .. }) if name == "a"));
+        assert!(app.alarm.is_active());
+        app.set_account_setting("b", false, false); assert!(!app.alarm.is_active());
+        assert_eq!(app.unread.count("a", peer), 1); assert_eq!(app.unread.count("b", peer), 1);
+        app.apply_event(Evt::AccountSettingSaved { name: "a".into(), connection: false, request_id: 1, result: Ok(()) });
+        app.set_account_setting("a", false, true); assert!(app.alarm.is_active());
+        app.set_alarm_enabled(false); assert!(!app.alarm.is_active());
+        app.set_alarm_enabled(true); assert!(app.alarm.is_active());
+    }
+
+    #[test]
+    fn disabled_account_retains_unread_but_stops_alarm_and_retries() {
+        let (tx, mut rx) = unbounded_channel(); let (_evt_tx, events) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a")], ..Config::default() };
+        let mut app = TelegramApp::new(cfg.clone(), tx, events, PathBuf::new(), false, egui::Context::default());
+        app.alarm = Alarm::silent_for_test(); let peer = PeerId::user(9);
+        app.unread.incoming("a", peer, 10); app.notifications.set_peer("a", peer, Some(0), Instant::now());
+        app.sync_alarm(); assert!(app.alarm.is_active());
+        app.set_account_setting("a", true, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::SetAccountEnabled { enabled: false, .. })));
+        assert!(!app.alarm.is_active()); assert_eq!(app.unread.count("a", peer), 1);
+        assert!(app.status.get("a") == Some(&ConnStatus::Disabled));
+        app.apply_event(Evt::Status { name: "a".into(), status: ConnStatus::Online });
+        assert!(app.status.get("a") == Some(&ConnStatus::Disabled));
+        app.apply_event(Evt::Config(cfg)); // stale snapshot must not revert the pending change
+        assert!(!app.cfg.find_account("a").unwrap().enabled);
+        app.request_dialog_refresh("a"); app.pump_dialog_refreshes(Instant::now());
+        assert!(rx.try_recv().is_err());
+        app.apply_event(Evt::AccountSettingSaved { name: "a".into(), connection: true, request_id: 1, result: Ok(()) });
+        app.set_account_setting("a", true, true);
+        assert!(!app.alarm.is_active()); // wait for fresh notification settings
+        app.apply_event(Evt::NotifySyncComplete { account: "a".into(), successful: true });
+        app.sync_alarm(); assert!(app.alarm.is_active());
+    }
+
+    #[test]
+    fn account_save_failure_is_visible_and_unsaved_choice_is_retained() {
+        let (tx, _rx) = unbounded_channel(); let (_evt_tx, events) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a")], ..Config::default() };
+        let mut app = TelegramApp::new(cfg, tx, events, PathBuf::new(), false, egui::Context::default());
+        app.set_account_setting("a", false, false);
+        app.apply_event(Evt::AccountSettingSaved { name: "a".into(), connection: false, request_id: 1, result: Err("read-only".into()) });
+        assert!(!app.cfg.find_account("a").unwrap().alarm_enabled);
+        assert!(app.account_setting_errors.contains_key(&("a".into(), false)));
+        assert!(app.toast.as_ref().unwrap().0.contains("could not be saved"));
+    }
+
+    #[tokio::test]
+    async fn worker_disable_preserves_session_file_and_persists_preferences() {
+        let dir = std::env::temp_dir().join(format!("mlxysftele-account-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(util::sessions_dir(&dir)).unwrap();
+        let path = util::session_path(&dir, "a"); std::fs::write(&path, b"session sentinel").unwrap();
+        let (evt_tx, evt_rx) = std_mpsc::channel();
+        let cfg = Config { accounts: vec![account("a"), account("b")], ..Config::default() };
+        let mut worker = Worker { data_dir: dir.clone(), cfg, evt_tx, ctx: egui::Context::default(),
+            conns: HashMap::new(), pending_logins: HashMap::new(), media_objects: HashMap::new() };
+        worker.set_account_alarm("a".into(), false, 1);
+        worker.set_account_enabled("a".into(), false, 2).await;
+        let saved = Config::load(&dir).unwrap();
+        assert!(!saved.find_account("a").unwrap().enabled); assert!(!saved.find_account("a").unwrap().alarm_enabled);
+        assert!(saved.find_account("b").unwrap().enabled); assert_eq!(std::fs::read(&path).unwrap(), b"session sentinel");
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::AccountSettingSaved { connection: false, result: Ok(()), .. })));
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::Status { status: ConnStatus::Disabled, .. })));
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::AccountSettingSaved { connection: true, result: Ok(()), .. })));
+        worker.bring_online("a".into()).await;
+        assert!(matches!(evt_rx.try_recv(), Ok(Evt::Status { status: ConnStatus::Disabled, .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), b"session sentinel");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

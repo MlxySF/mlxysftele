@@ -28,7 +28,15 @@ pub struct AccountMeta {
     pub created_unix: u64,
     /// Unix seconds of the last interactive login.
     pub last_login_unix: Option<u64>,
+    /// GUI connection preference; disabling keeps the session intact.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Local alarm preference, independent of Telegram mute settings.
+    #[serde(default = "default_true")]
+    pub alarm_enabled: bool,
 }
+
+fn default_true() -> bool { true }
 
 /// Root configuration document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +175,8 @@ mod tests {
             username: Some("someone".to_string()),
             created_unix: 1_760_000_000,
             last_login_unix: Some(1_762_900_000),
+            enabled: true,
+            alarm_enabled: true,
         }
     }
 
@@ -216,6 +226,19 @@ mod tests {
         assert!(cfg.accounts.is_empty());
         assert_eq!(cfg.api_id, None);
         assert!(cfg.alarm_enabled); // existing configs default to enabled
+    }
+
+    #[test]
+    fn old_accounts_default_to_enabled_and_alarm_enabled() {
+        let config: Config = serde_json::from_str(r#"{"accounts":[{"name":"old","phone":null,"user_id":null,"username":null,"created_unix":1,"last_login_unix":null}]}"#).unwrap();
+        assert!(config.accounts[0].enabled);
+        assert!(config.accounts[0].alarm_enabled);
+        let mut changed = config;
+        changed.accounts[0].enabled = false;
+        changed.accounts[0].alarm_enabled = false;
+        let loaded: Config = serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert!(!loaded.accounts[0].enabled);
+        assert!(!loaded.accounts[0].alarm_enabled);
     }
 
     #[test]

@@ -108,6 +108,15 @@ an OpenGL-capable system and graphics driver.
   at runtime, so the application builds and runs without it; playback requires
   installing the shared library as described below. Video files land in
   `<data_dir>/cache/media/` like photos.
+- **Per-account controls** — under Settings → Accounts, turn **Alarm** off or
+  on for each account independently. The global alarm switch is an override;
+  Telegram chat mutes still apply, and unread badges remain visible. Turn
+  **Account enabled** off to disconnect an account without signing out or
+  deleting its session; turn it on to reconnect. Both choices persist across
+  restarts when the settings can be saved. While disabled, the account does not
+  sync or sound alarms and its cached unread counts can be stale. This controls
+  the GUI client, not Telegram sessions on other devices or CLI commands.
+  Enable a disabled account before using **Sign out** in the GUI.
 - **Repeated unread alarm** — three loud beeps repeat every 1.5 seconds while
   an unmuted chat has unread messages, including while the window is minimized.
   Use **Alarm: ON/OFF** in the top bar to enable or disable it for all accounts;

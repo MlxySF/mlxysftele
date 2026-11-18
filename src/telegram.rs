@@ -284,6 +284,7 @@ fn persist_user(
         .find_account(name)
         .map(|a| a.created_unix)
         .unwrap_or(now);
+    let (enabled, alarm_enabled) = cfg.find_account(name).map(|a| (a.enabled, a.alarm_enabled)).unwrap_or((true, true));
     cfg.upsert_account(AccountMeta {
         name: name.to_string(),
         phone: Some(phone.to_string()),
@@ -291,6 +292,7 @@ fn persist_user(
         username: username.clone(),
         created_unix: created,
         last_login_unix: Some(now),
+        enabled, alarm_enabled,
     });
     cfg.save(data_dir)?;
     println!();
